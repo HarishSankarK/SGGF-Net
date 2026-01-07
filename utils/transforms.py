@@ -101,13 +101,16 @@ class Pad:
         return image, target
 
 
-def get_train_transform(max_size=1536):
+def get_train_transform(max_size=1536, multi_scale=False):
     """Get training transforms with data augmentation"""
+    # Use multi-scale if enabled (randomly sample from [1024, 1280, 1536])
+    # Pad to maximum size to ensure consistent batch shapes
+    max_pad_size = max_size if not multi_scale else 1536
     return Compose([
         ToTensor(),
         RandomHorizontalFlip(prob=0.5),
-        Resize(max_size=max_size),
-        Pad(size=(max_size, max_size), fill=0)
+        Resize(max_size=max_size, multi_scale=multi_scale),
+        Pad(size=(max_pad_size, max_pad_size), fill=0)
     ])
 
 

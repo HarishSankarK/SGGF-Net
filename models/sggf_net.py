@@ -174,11 +174,13 @@ class SGGFNet(nn.Module):
         self.box_nms_thresh = box_nms_thresh
         self.box_score_thresh = box_score_thresh
         
-        # GFEM - Optimized for speed: reduced embed_dim, heads, layers, larger patch_size
+        # GFEM - Optimized for speed and memory: reduced embed_dim, heads, layers, larger patch_size
         # Original: embed_dim=256, num_heads=8, num_layers=4, patch_size=16
-        # Optimized: embed_dim=192, num_heads=6, num_layers=3, patch_size=8
+        # Optimized: embed_dim=192, num_heads=6, num_layers=3, patch_size=32 (increased for memory efficiency)
         # Speed gain: ~2-3x faster, accuracy impact: <1% AP
-        self.gfem = GFEM(in_channels=3, embed_dim=192, patch_size=8, num_layers=3, num_heads=6)
+        # Memory: patch_size=32 reduces attention matrix by 64x compared to patch_size=8
+        # With max_size=800: (800/32)^2 = 25^2 = 625 patches (very memory efficient)
+        self.gfem = GFEM(in_channels=3, embed_dim=192, patch_size=32, num_layers=3, num_heads=6)
         
         # ResNet Backbone
         self.backbone = ResNetBackbone(pretrained=pretrained)
