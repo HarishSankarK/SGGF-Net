@@ -45,14 +45,24 @@ class RandomHorizontalFlip:
 
 class Resize:
     """Resize image while maintaining aspect ratio"""
-    def __init__(self, max_size=1536):
+    def __init__(self, max_size=1536, multi_scale=False):
         self.max_size = max_size
+        self.multi_scale = multi_scale
+        if multi_scale:
+            # Multi-scale training: randomly sample from [1024, 1280, 1536]
+            self.scales = [1024, 1280, 1536]
     
     def __call__(self, image, target):
         h, w = image.shape[1], image.shape[2]
         
+        # Multi-scale training: randomly sample max_size
+        if self.multi_scale:
+            max_size = self.scales[torch.randint(0, len(self.scales), (1,)).item()]
+        else:
+            max_size = self.max_size
+        
         # Calculate scale
-        scale = min(self.max_size / h, self.max_size / w)
+        scale = min(max_size / h, max_size / w)
         new_h, new_w = int(h * scale), int(w * scale)
         
         # Resize image

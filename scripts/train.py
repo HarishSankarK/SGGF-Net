@@ -5,6 +5,7 @@ Training script for SGGF-Net
 import os
 import sys
 import argparse
+import math
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -34,8 +35,9 @@ def collate_fn(batch):
     return images, targets
 
 
-def train_one_epoch(model, dataloader, optimizer, device, epoch, scaler=None, use_amp=False):
-    """Train for one epoch with optional mixed precision"""
+def train_one_epoch(model, dataloader, optimizer, device, epoch, scaler=None, use_amp=False, 
+                   max_grad_norm=10.0, grad_accum_steps=1):
+    """Train for one epoch with optional mixed precision and gradient accumulation"""
     model.train()
     total_loss = 0.0
     
@@ -45,8 +47,6 @@ def train_one_epoch(model, dataloader, optimizer, device, epoch, scaler=None, us
         targets = [{k: v.to(device, non_blocking=True) for k, v in t.items()} for t in targets]
         
         # Forward pass with mixed precision if enabled
-        optimizer.zero_grad()
-        
         if use_amp and scaler is not None:
             # Use device-specific autocast (PyTorch 2.0+) or legacy autocast
             if USE_NEW_AMP and device.type == 'cuda':
@@ -60,22 +60,48 @@ def train_one_epoch(model, dataloader, optimizer, device, epoch, scaler=None, us
             else:
                 loss_dict = model(images, targets)
                 losses = sum(loss for loss in loss_dict.values())
-            
-            # Backward pass with gradient scaling
-            scaler.scale(losses).backward()
-            scaler.step(optimizer)
-            scaler.update()
         else:
             # Standard precision
             loss_dict = model(images, targets)
             losses = sum(loss for loss in loss_dict.values())
-            losses.backward()
-            optimizer.step()
         
-        total_loss += losses.item()
+        # CRITICAL FIX: Skip batch if loss is NaN/Inf (prevents training crash)
+        if not torch.isfinite(losses):
+            print(f'⚠ Warning: NaN/Inf loss detected at batch {batch_idx+1}. Skipping this batch.')
+            print(f'   Loss breakdown: {loss_dict}')
+            optimizer.zero_grad(set_to_none=True)
+            continue
+        
+        # Scale loss for gradient accumulation
+        losses = losses / grad_accum_steps
+        
+        # Backward pass with gradient scaling
+        if use_amp and scaler is not None:
+            scaler.scale(losses).backward()
+        else:
+            losses.backward()
+        
+        # Update optimizer only after accumulating gradients
+        if (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1) == len(dataloader):
+            if use_amp and scaler is not None:
+                # Gradient clipping before optimizer step
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                
+                optimizer.step()
+            
+            optimizer.zero_grad(set_to_none=True)
+        
+        total_loss += losses.item() * grad_accum_steps  # Scale back for reporting
         
         if (batch_idx + 1) % 10 == 0:
-            print(f'Epoch [{epoch}], Batch [{batch_idx+1}/{len(dataloader)}], Loss: {losses.item():.4f}')
+            print(f'Epoch [{epoch}], Batch [{batch_idx+1}/{len(dataloader)}], Loss: {losses.item() * grad_accum_steps:.4f}')
     
     return total_loss / len(dataloader)
 
@@ -117,7 +143,9 @@ def main():
     parser.add_argument('--num_classes', type=int, default=11, help='Number of classes')
     parser.add_argument('--batch_size', type=int, default=2, help='Batch size')
     parser.add_argument('--num_epochs', type=int, default=50, help='Number of epochs')
-    parser.add_argument('--lr', type=float, default=0.005, help='Learning rate')
+    parser.add_argument('--lr', type=float, default=0.0005, help='Learning rate (default: 0.0005, optimized for stability)')
+    parser.add_argument('--grad_accum_steps', type=int, default=1, help='Gradient accumulation steps (default: 1, use 2 for effective batch_size=4)')
+    parser.add_argument('--warmup_epochs', type=int, default=5, help='Warmup epochs for learning rate (default: 5)')
     parser.add_argument('--momentum', type=float, default=0.9, help='Momentum')
     parser.add_argument('--weight_decay', type=float, default=0.0001, help='Weight decay')
     parser.add_argument('--max_size', type=int, default=1024, 
@@ -134,6 +162,8 @@ def main():
                         help='Use torch.compile for faster training (PyTorch 2.0+, default: False)')
     parser.add_argument('--val_freq', type=int, default=5,
                         help='Validate every N epochs (default: 5, set to 1 for every epoch)')
+    parser.add_argument('--multi_scale', action='store_true', default=False,
+                        help='Enable multi-scale training (randomly sample from [1024, 1280, 1536])')
     
     args = parser.parse_args()
     
@@ -145,8 +175,8 @@ def main():
     device = torch.device(args.device)
     print(f'Using device: {device}')
     
-    # Dataset
-    train_transform = get_train_transform(max_size=args.max_size)
+    # Dataset with optional multi-scale training
+    train_transform = get_train_transform(max_size=args.max_size, multi_scale=args.multi_scale)
     val_transform = get_val_transform(max_size=args.max_size)
     
     if args.dataset == 'visdrone':
@@ -179,10 +209,20 @@ def main():
     model = model.to(device)
     
     # Optional: Compile model for faster training (PyTorch 2.0+)
+    # Note: torch.compile can cause OOM during compilation, so use with caution
     if args.compile and hasattr(torch, 'compile'):
         print('Compiling model with torch.compile for faster training...')
-        model = torch.compile(model, mode='reduce-overhead')
-        print('✓ Model compiled')
+        print('⚠ Warning: torch.compile may cause OOM. If you get OOM errors, disable with --no_compile')
+        try:
+            # Use 'default' mode instead of 'reduce-overhead' to reduce memory usage during compilation
+            model = torch.compile(model, mode='default')
+            print('✓ Model compiled')
+        except RuntimeError as e:
+            if 'out of memory' in str(e).lower() or 'OOM' in str(e):
+                print('⚠ torch.compile failed due to OOM. Continuing without compilation.')
+                print('   Training will still be fast with AMP enabled.')
+            else:
+                raise
     
     # Mixed precision training (AMP) - 1.5-2x speedup with minimal accuracy impact
     scaler = None
@@ -203,8 +243,24 @@ def main():
         weight_decay=args.weight_decay
     )
     
-    # Learning rate scheduler
-    scheduler = lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+    # Learning rate scheduler - Use CosineAnnealingLR with warmup for better convergence
+    if args.warmup_epochs > 0:
+        # Warmup + Cosine annealing
+        from torch.optim.lr_scheduler import LambdaLR
+        
+        def lr_lambda(epoch):
+            if epoch < args.warmup_epochs:
+                # Linear warmup
+                return (epoch + 1) / args.warmup_epochs
+            else:
+                # Cosine annealing
+                return 0.5 * (1 + math.cos(math.pi * (epoch - args.warmup_epochs) / (args.num_epochs - args.warmup_epochs)))
+        
+        scheduler = LambdaLR(optimizer, lr_lambda)
+        print(f'✓ Using warmup ({args.warmup_epochs} epochs) + cosine annealing scheduler')
+    else:
+        # Fallback to step LR
+        scheduler = lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
     
     # Resume from checkpoint (supports both local and Drive paths)
     start_epoch = 0
@@ -227,7 +283,8 @@ def main():
         print('-' * 50)
         
         # Train
-        train_loss = train_one_epoch(model, train_loader, optimizer, device, epoch+1, scaler, use_amp)
+        train_loss = train_one_epoch(model, train_loader, optimizer, device, epoch+1, scaler, use_amp, 
+                                    max_grad_norm=10.0, grad_accum_steps=args.grad_accum_steps)
         print(f'Train Loss: {train_loss:.4f}')
         
         # Validate (less frequently to save time)

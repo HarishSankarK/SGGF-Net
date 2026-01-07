@@ -7,6 +7,40 @@ import torch.nn as nn
 import math
 
 
+def corners_to_center(boxes):
+    """
+    Convert boxes from corner format [x1, y1, x2, y2] to center format [x_center, y_center, width, height]
+    
+    Args:
+        boxes: (N, 4) in [x1, y1, x2, y2] format
+    Returns:
+        boxes: (N, 4) in [x_center, y_center, width, height] format
+    """
+    x1, y1, x2, y2 = boxes.unbind(1)
+    cx = (x1 + x2) / 2
+    cy = (y1 + y2) / 2
+    w = x2 - x1
+    h = y2 - y1
+    return torch.stack([cx, cy, w, h], dim=1)
+
+
+def center_to_corners(boxes):
+    """
+    Convert boxes from center format [x_center, y_center, width, height] to corner format [x1, y1, x2, y2]
+    
+    Args:
+        boxes: (N, 4) in [x_center, y_center, width, height] format
+    Returns:
+        boxes: (N, 4) in [x1, y1, x2, y2] format
+    """
+    cx, cy, w, h = boxes.unbind(1)
+    x1 = cx - w / 2
+    y1 = cy - h / 2
+    x2 = cx + w / 2
+    y2 = cy + h / 2
+    return torch.stack([x1, y1, x2, y2], dim=1)
+
+
 def generate_anchors(base_size=16, scales=[8, 16, 32], aspect_ratios=[0.5, 1.0, 2.0]):
     """
     Generate anchor boxes at a single location
@@ -30,7 +64,7 @@ def generate_anchors(base_size=16, scales=[8, 16, 32], aspect_ratios=[0.5, 1.0, 
 
 
 def generate_anchors_for_feature_map(feature_map_size, stride, base_size=16, 
-                                     scales=[8, 16, 32], aspect_ratios=[0.5, 1.0, 2.0]):
+                                     scales=[8, 16, 32], aspect_ratios=[0.5, 1.0, 2.0], device=None):
     """
     Generate all anchor boxes for a feature map
     
@@ -40,6 +74,7 @@ def generate_anchors_for_feature_map(feature_map_size, stride, base_size=16,
         base_size: Base size for anchors
         scales: List of scales
         aspect_ratios: List of aspect ratios
+        device: Device to create tensors on (optional)
     Returns:
         anchors: (H * W * num_anchors, 4) tensor in [x_center, y_center, width, height] format
     """
@@ -48,10 +83,12 @@ def generate_anchors_for_feature_map(feature_map_size, stride, base_size=16,
     
     # Generate base anchors
     base_anchors = generate_anchors(base_size, scales, aspect_ratios)  # (num_anchors, 4)
+    if device is not None:
+        base_anchors = base_anchors.to(device)
     
     # Generate grid of centers
-    y_centers = torch.arange(0.5, H, 1.0) * stride
-    x_centers = torch.arange(0.5, W, 1.0) * stride
+    y_centers = torch.arange(0.5, H, 1.0, device=base_anchors.device) * stride
+    x_centers = torch.arange(0.5, W, 1.0, device=base_anchors.device) * stride
     
     # Create meshgrid
     y_grid, x_grid = torch.meshgrid(y_centers, x_centers, indexing='ij')
@@ -88,17 +125,25 @@ def box_transform(anchors, deltas):
     anchor_w = anchors[:, 2]
     anchor_h = anchors[:, 3]
     
-    # Extract deltas
-    dx = deltas[:, 0]
-    dy = deltas[:, 1]
-    dw = deltas[:, 2]
-    dh = deltas[:, 3]
+    # Extract deltas and clamp to prevent extreme values
+    dx = torch.clamp(deltas[:, 0], min=-10, max=10)
+    dy = torch.clamp(deltas[:, 1], min=-10, max=10)
+    dw = torch.clamp(deltas[:, 2], min=-10, max=10)
+    dh = torch.clamp(deltas[:, 3], min=-10, max=10)
+    
+    # Clamp anchor dimensions to avoid numerical issues
+    anchor_w = torch.clamp(anchor_w, min=1e-6)
+    anchor_h = torch.clamp(anchor_h, min=1e-6)
     
     # Apply transformation
     pred_x = anchor_x + dx * anchor_w
     pred_y = anchor_y + dy * anchor_h
     pred_w = anchor_w * torch.exp(dw)
     pred_h = anchor_h * torch.exp(dh)
+    
+    # Clamp output to reasonable values
+    pred_w = torch.clamp(pred_w, min=1.0, max=1e6)
+    pred_h = torch.clamp(pred_h, min=1.0, max=1e6)
     
     return torch.stack([pred_x, pred_y, pred_w, pred_h], dim=1)
 
@@ -117,11 +162,27 @@ def box_transform_inv(boxes, anchors):
     box_x, box_y, box_w, box_h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
     anchor_x, anchor_y, anchor_w, anchor_h = anchors[:, 0], anchors[:, 1], anchors[:, 2], anchors[:, 3]
     
-    # Compute deltas
+    # Clamp widths and heights to avoid negative or zero values
+    box_w = torch.clamp(box_w, min=1e-6)
+    box_h = torch.clamp(box_h, min=1e-6)
+    anchor_w = torch.clamp(anchor_w, min=1e-6)
+    anchor_h = torch.clamp(anchor_h, min=1e-6)
+    
+    # Compute deltas with numerical stability
     dx = (box_x - anchor_x) / (anchor_w + 1e-6)
     dy = (box_y - anchor_y) / (anchor_h + 1e-6)
-    dw = torch.log(box_w / (anchor_w + 1e-6))
-    dh = torch.log(box_h / (anchor_h + 1e-6))
+    
+    # Clamp ratios before log to avoid NaN
+    ratio_w = torch.clamp(box_w / (anchor_w + 1e-6), min=1e-6, max=1e6)
+    ratio_h = torch.clamp(box_h / (anchor_h + 1e-6), min=1e-6, max=1e6)
+    dw = torch.log(ratio_w)
+    dh = torch.log(ratio_h)
+    
+    # Clamp deltas to reasonable range to prevent NaN
+    dx = torch.clamp(dx, min=-10, max=10)
+    dy = torch.clamp(dy, min=-10, max=10)
+    dw = torch.clamp(dw, min=-10, max=10)
+    dh = torch.clamp(dh, min=-10, max=10)
     
     return torch.stack([dx, dy, dw, dh], dim=1)
 
@@ -188,17 +249,21 @@ def nms(boxes, scores, iou_threshold=0.5, max_detections=100):
     sorted_scores, sorted_indices = torch.sort(scores, descending=True)
     boxes_sorted = boxes_corners[sorted_indices]
     
-    keep = []
-    while len(keep) < max_detections and len(boxes_sorted) > 0:
-        # Keep the box with highest score
-        keep.append(sorted_indices[0].item())
+    # Use tensor-based approach instead of list to avoid .item() calls
+    keep_list = []
+    remaining_indices = sorted_indices.clone()
+    remaining_boxes = boxes_sorted.clone()
+    
+    while len(keep_list) < max_detections and len(remaining_boxes) > 0:
+        # Keep the box with highest score (index 0)
+        keep_list.append(remaining_indices[0])
         
-        if len(boxes_sorted) == 1:
+        if len(remaining_boxes) == 1:
             break
         
         # Compute IoU with remaining boxes
-        current_box = boxes_sorted[0:1]
-        other_boxes = boxes_sorted[1:]
+        current_box = remaining_boxes[0:1]
+        other_boxes = remaining_boxes[1:]
         
         # Calculate IoU
         inter_x1 = torch.max(current_box[:, 0], other_boxes[:, 0])
@@ -216,8 +281,14 @@ def nms(boxes, scores, iou_threshold=0.5, max_detections=100):
         
         # Keep boxes with IoU < threshold
         mask = ious < iou_threshold
-        boxes_sorted = boxes_sorted[1:][mask]
-        sorted_indices = sorted_indices[1:][mask]
+        
+        # Update remaining boxes and indices
+        remaining_boxes = remaining_boxes[1:][mask]
+        remaining_indices = remaining_indices[1:][mask]
     
-    return torch.tensor(keep, dtype=torch.long, device=boxes.device)
+    # Convert list to tensor (only convert at the end to avoid graph breaks)
+    if len(keep_list) > 0:
+        return torch.stack(keep_list)
+    else:
+        return torch.tensor([], dtype=torch.long, device=boxes.device)
 

@@ -101,10 +101,18 @@ class NDPA(nn.Module):
         # Determinant terms
         det_sigma1 = torch.det(sigma1)  # (N,)
         det_sigma2 = torch.det(sigma2)  # (M,)
+        
+        # Clamp determinants to avoid negative or zero values
+        det_sigma1 = torch.clamp(det_sigma1, min=1e-10)
+        det_sigma2 = torch.clamp(det_sigma2, min=1e-10)
+        
         log_det = torch.log(det_sigma2.unsqueeze(0) / (det_sigma1.unsqueeze(1) + 1e-10))  # (N, M)
         
         # KL divergence
         kl = 0.5 * (trace_term + quadratic - 2 + log_det)
+        
+        # Clamp KL to reasonable range to prevent NaN
+        kl = torch.clamp(kl, min=-100, max=100)
         
         return kl
     
