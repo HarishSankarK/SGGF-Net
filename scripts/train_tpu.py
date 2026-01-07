@@ -168,14 +168,65 @@ def main():
     
     args = parser.parse_args()
     
-    # TPU setup
+    # TPU setup with proper error handling
+    is_tpu = False
+    device = None
+    
     if TPU_AVAILABLE:
-        device = xm.xla_device()
-        print(f'✓ Using TPU device: {device}')
-        print(f'✓ TPU cores: {xm.xla_world_size()}')
+        # Try to initialize TPU with comprehensive error handling
+        device_initialized = False
+        try:
+            # First try new API (torch_xla 2.9+)
+            try:
+                import torch_xla
+                device = torch_xla.device()
+                print(f'✓ Using TPU device (new API): {device}')
+                is_tpu = True
+                device_initialized = True
+                # Get world size if available
+                try:
+                    world_size = xm.xla_world_size()
+                    print(f'✓ TPU cores: {world_size}')
+                except (AttributeError, TypeError):
+                    try:
+                        world_size = torch_xla._XLAC._xla_get_replication_devices_count()
+                        print(f'✓ TPU cores: {world_size}')
+                    except:
+                        print('✓ TPU device initialized (core count unavailable)')
+            except (RuntimeError, Exception) as e:
+                # New API failed, try old API
+                if not device_initialized:
+                    try:
+                        device = xm.xla_device()
+                        print(f'✓ Using TPU device (old API): {device}')
+                        is_tpu = True
+                        device_initialized = True
+                    except (RuntimeError, Exception) as e2:
+                        # Both APIs failed
+                        print(f'⚠ TPU initialization failed')
+                        print(f'   New API error: {str(e)[:100]}')
+                        print(f'   Old API error: {str(e2)[:100]}')
+                        device_initialized = False
+        except (RuntimeError, Exception) as e:
+            # Catch any other exceptions
+            print(f'⚠ TPU initialization failed: {str(e)[:200]}')
+            device_initialized = False
+        
+        # If TPU initialization failed, fall back to GPU/CPU
+        if not device_initialized:
+            print('⚠ Falling back to CPU/GPU')
+            TPU_AVAILABLE = False
+            is_tpu = False
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            print(f'✓ Using device: {device}')
     else:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f'⚠ TPU not available, using device: {device}')
+    
+    # Ensure device is set
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f'✓ Final device: {device}')
     
     # Create checkpoint directory
     os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -213,19 +264,27 @@ def main():
     )
     
     # Wrap DataLoader for TPU
-    if TPU_AVAILABLE:
-        train_loader = pl.MpDeviceLoader(train_loader, device)
-        val_loader = pl.MpDeviceLoader(val_loader, device)
-        print('✓ Using TPU parallel data loader')
+    if TPU_AVAILABLE and device.type == 'xla':
+        try:
+            train_loader = pl.MpDeviceLoader(train_loader, device)
+            val_loader = pl.MpDeviceLoader(val_loader, device)
+            print('✓ Using TPU parallel data loader')
+        except Exception as e:
+            print(f'⚠ Warning: Could not create TPU data loader: {e}')
+            print('⚠ Using standard data loader')
     
     # Model
     model = SGGFNet(num_classes=args.num_classes, pretrained=True)
     model = model.to(device)
     
     # TPU: Move model to TPU device
-    if TPU_AVAILABLE:
-        model = xm.send_cpu_data_to_device(model, device)
-        print('✓ Model moved to TPU')
+    if is_tpu and device.type == 'xla':
+        try:
+            model = xm.send_cpu_data_to_device(model, device)
+            print('✓ Model moved to TPU')
+        except Exception as e:
+            print(f'⚠ Warning: Could not move model to TPU: {e}')
+            print('⚠ Continuing with model on current device')
     
     # Mixed precision training (AMP)
     scaler = None
@@ -284,7 +343,7 @@ def main():
         
         # Train
         train_loss = train_one_epoch(model, train_loader, optimizer, device, epoch+1, scaler, use_amp, 
-                                    max_grad_norm=10.0, grad_accum_steps=args.grad_accum_steps)
+                                    max_grad_norm=10.0, grad_accum_steps=args.grad_accum_steps, is_tpu=is_tpu)
         print(f'Train Loss: {train_loss:.4f}')
         
         # Update learning rate
@@ -333,8 +392,12 @@ def main():
             if metrics['mAP'] > best_map:
                 best_map = metrics['mAP']
                 best_path = os.path.join(args.checkpoint_dir, 'best_model.pth')
-                if TPU_AVAILABLE:
-                    xm.save(model.state_dict(), best_path)
+                if is_tpu and device.type == 'xla':
+                    try:
+                        xm.save(model.state_dict(), best_path)
+                    except Exception as e:
+                        print(f'⚠ Warning: Could not save with xm.save: {e}')
+                        torch.save(model.state_dict(), best_path)
                 else:
                     torch.save(model.state_dict(), best_path)
                 print(f'✓ Saved best model (mAP: {best_map:.4f})')
