@@ -10,6 +10,14 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim import SGD
 import torch.optim.lr_scheduler as lr_scheduler
+try:
+    # PyTorch 2.0+ uses torch.amp
+    from torch.amp import autocast, GradScaler
+    USE_NEW_AMP = True
+except ImportError:
+    # Fallback for older PyTorch versions
+    from torch.cuda.amp import autocast, GradScaler
+    USE_NEW_AMP = False
 
 # Add parent directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -26,26 +34,43 @@ def collate_fn(batch):
     return images, targets
 
 
-def train_one_epoch(model, dataloader, optimizer, device, epoch):
-    """Train for one epoch"""
+def train_one_epoch(model, dataloader, optimizer, device, epoch, scaler=None, use_amp=False):
+    """Train for one epoch with optional mixed precision"""
     model.train()
     total_loss = 0.0
     
     for batch_idx, (images, targets) in enumerate(dataloader):
-        # Move to device
-        images = [img.to(device) for img in images]
-        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        # Move to device (non-blocking for faster transfer)
+        images = [img.to(device, non_blocking=True) for img in images]
+        targets = [{k: v.to(device, non_blocking=True) for k, v in t.items()} for t in targets]
         
-        # Forward pass
-        loss_dict = model(images, targets)
-        
-        # Sum all losses
-        losses = sum(loss for loss in loss_dict.values())
-        
-        # Backward pass
+        # Forward pass with mixed precision if enabled
         optimizer.zero_grad()
-        losses.backward()
-        optimizer.step()
+        
+        if use_amp and scaler is not None:
+            # Use device-specific autocast (PyTorch 2.0+) or legacy autocast
+            if USE_NEW_AMP and device.type == 'cuda':
+                with autocast(device_type='cuda'):
+                    loss_dict = model(images, targets)
+                    losses = sum(loss for loss in loss_dict.values())
+            elif not USE_NEW_AMP and device.type == 'cuda':
+                with autocast():
+                    loss_dict = model(images, targets)
+                    losses = sum(loss for loss in loss_dict.values())
+            else:
+                loss_dict = model(images, targets)
+                losses = sum(loss for loss in loss_dict.values())
+            
+            # Backward pass with gradient scaling
+            scaler.scale(losses).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            # Standard precision
+            loss_dict = model(images, targets)
+            losses = sum(loss for loss in loss_dict.values())
+            losses.backward()
+            optimizer.step()
         
         total_loss += losses.item()
         
@@ -95,11 +120,20 @@ def main():
     parser.add_argument('--lr', type=float, default=0.005, help='Learning rate')
     parser.add_argument('--momentum', type=float, default=0.9, help='Momentum')
     parser.add_argument('--weight_decay', type=float, default=0.0001, help='Weight decay')
-    parser.add_argument('--max_size', type=int, default=1536, help='Max image size')
+    parser.add_argument('--max_size', type=int, default=1024, 
+                        help='Max image size (default: 1024, use 1536 only if you have enough GPU memory)')
     parser.add_argument('--checkpoint_dir', type=str, default='checkpoints', help='Checkpoint directory (use Drive path in Colab)')
     parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint (can be Drive path)')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
                         help='Device to use')
+    parser.add_argument('--use_amp', action='store_true', default=True,
+                        help='Use Automatic Mixed Precision (AMP) for faster training (default: True)')
+    parser.add_argument('--no_amp', dest='use_amp', action='store_false',
+                        help='Disable AMP (use full precision)')
+    parser.add_argument('--compile', action='store_true', default=False,
+                        help='Use torch.compile for faster training (PyTorch 2.0+, default: False)')
+    parser.add_argument('--val_freq', type=int, default=5,
+                        help='Validate every N epochs (default: 5, set to 1 for every epoch)')
     
     args = parser.parse_args()
     
@@ -125,18 +159,41 @@ def main():
         train_dataset = HITUAVDataset(args.data_dir, split='train', transform=train_transform, convert_to_rgb=True)
         val_dataset = HITUAVDataset(args.data_dir, split='val', transform=val_transform, convert_to_rgb=True)
     
+    # Optimized DataLoader settings for speed
+    # Increase num_workers for faster data loading (Colab typically supports 2-4)
+    num_workers = min(4, os.cpu_count() or 2)  # Use up to 4 workers
+    
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True,
-        collate_fn=collate_fn, num_workers=4
+        collate_fn=collate_fn, num_workers=num_workers, pin_memory=True,
+        prefetch_factor=2, persistent_workers=True if num_workers > 0 else False
     )
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False,
-        collate_fn=collate_fn, num_workers=4
+        collate_fn=collate_fn, num_workers=num_workers, pin_memory=True,
+        prefetch_factor=2, persistent_workers=True if num_workers > 0 else False
     )
     
     # Model
     model = SGGFNet(num_classes=args.num_classes, pretrained=True)
     model = model.to(device)
+    
+    # Optional: Compile model for faster training (PyTorch 2.0+)
+    if args.compile and hasattr(torch, 'compile'):
+        print('Compiling model with torch.compile for faster training...')
+        model = torch.compile(model, mode='reduce-overhead')
+        print('✓ Model compiled')
+    
+    # Mixed precision training (AMP) - 1.5-2x speedup with minimal accuracy impact
+    scaler = None
+    use_amp = args.use_amp and device.type == 'cuda'
+    if use_amp:
+        # Use device-specific GradScaler for PyTorch 2.0+, legacy for older versions
+        if USE_NEW_AMP and device.type == 'cuda':
+            scaler = GradScaler(device='cuda')
+        else:
+            scaler = GradScaler()
+        print('✓ Using Automatic Mixed Precision (AMP) for faster training')
     
     # Optimizer
     optimizer = SGD(
@@ -170,13 +227,17 @@ def main():
         print('-' * 50)
         
         # Train
-        train_loss = train_one_epoch(model, train_loader, optimizer, device, epoch+1)
+        train_loss = train_one_epoch(model, train_loader, optimizer, device, epoch+1, scaler, use_amp)
         print(f'Train Loss: {train_loss:.4f}')
         
-        # Validate
-        metrics = validate(model, val_loader, device, args.num_classes)
-        print(f'Validation - mAP: {metrics["mAP"]:.4f}, AP50: {metrics["AP50"]:.4f}')
-        print(f'Precision: {metrics["precision"]:.4f}, Recall: {metrics["recall"]:.4f}, F1: {metrics["f1"]:.4f}')
+        # Validate (less frequently to save time)
+        metrics = None
+        if (epoch + 1) % args.val_freq == 0 or (epoch + 1) == args.num_epochs:
+            metrics = validate(model, val_loader, device, args.num_classes)
+            print(f'Validation - mAP: {metrics["mAP"]:.4f}, AP50: {metrics["AP50"]:.4f}')
+            print(f'Precision: {metrics["precision"]:.4f}, Recall: {metrics["recall"]:.4f}, F1: {metrics["f1"]:.4f}')
+        else:
+            print(f'Skipping validation (validate every {args.val_freq} epochs)')
         
         # Update learning rate
         scheduler.step()
@@ -186,14 +247,18 @@ def main():
             'epoch': epoch + 1,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'metrics': metrics
+            'train_loss': train_loss
         }
+        
+        # Add metrics if available
+        if metrics is not None:
+            checkpoint['metrics'] = metrics
         
         # Save latest
         torch.save(checkpoint, os.path.join(args.checkpoint_dir, 'latest.pth'))
         
-        # Save best
-        if metrics['mAP'] > best_map:
+        # Save best (only if metrics are available)
+        if metrics is not None and metrics['mAP'] > best_map:
             best_map = metrics['mAP']
             torch.save(checkpoint, os.path.join(args.checkpoint_dir, 'best.pth'))
             print(f'New best mAP: {best_map:.4f}')
