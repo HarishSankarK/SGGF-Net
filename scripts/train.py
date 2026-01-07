@@ -171,9 +171,19 @@ def main():
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     print(f'Checkpoint directory: {args.checkpoint_dir}')
     
-    # Device
-    device = torch.device(args.device)
-    print(f'Using device: {device}')
+    # Device with CUDA verification
+    if args.device == 'cuda':
+        if not torch.cuda.is_available():
+            print('⚠ CUDA requested but not available. Falling back to CPU.')
+            print('⚠ To use GPU, run Step 2 in the notebook to install CUDA PyTorch.')
+            device = torch.device('cpu')
+        else:
+            device = torch.device('cuda')
+            print(f'✓ Using device: {device}')
+            print(f'✓ CUDA device: {torch.cuda.get_device_name(0)}')
+    else:
+        device = torch.device(args.device)
+        print(f'Using device: {device}')
     
     # Dataset with optional multi-scale training
     train_transform = get_train_transform(max_size=args.max_size, multi_scale=args.multi_scale)
