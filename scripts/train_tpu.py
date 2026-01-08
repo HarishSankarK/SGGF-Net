@@ -162,10 +162,20 @@ def main():
     device = None
 
     # Try TPU init (new API then old API), otherwise fall back
+    # Note: If TPU is already initialized, we'll reuse it instead of reinitializing
     if tpu_available:
         try:
-            # Try new API (torch_xla 2.9+)
+            # Check if TPU environment is available first
+            import os
+            tpu_addr = os.environ.get('COLAB_TPU_ADDR', '')
+            
+            # Try new API (torch_xla 2.9+) - this gets existing device if already initialized
+            # Note: Even if COLAB_TPU_ADDR is not set, TPU might still be available
+            if not tpu_addr:
+                print('⚠ COLAB_TPU_ADDR not set, but checking if TPU is available...')
+            
             try:
+                # Use device() which gets the device without forcing reinit
                 device = torch_xla.device()
                 print(f'✓ Using TPU device (new API): {device}')
                 is_tpu = True
@@ -179,16 +189,44 @@ def main():
                     except Exception:
                         print('✓ TPU initialized')
             except Exception as e_new:
-                # Try old API
-                try:
-                    device = xm.xla_device()
-                    print(f'✓ Using TPU device (old API): {device}')
-                    is_tpu = True
-                except Exception as e_old:
-                    print('⚠ TPU init failed')
-                    print(f'  New API: {str(e_new)[:120]}')
-                    print(f'  Old API: {str(e_old)[:120]}')
-                    tpu_available = False
+                    # Try old API as fallback
+                    try:
+                        device = xm.xla_device()
+                        print(f'✓ Using TPU device (old API): {device}')
+                        is_tpu = True
+                    except Exception as e_old:
+                        # If device is busy, try multiple strategies to recover
+                        error_str = str(e_old)
+                        if 'Device or resource busy' in error_str or 'iommu' in error_str.lower():
+                            print('⚠ TPU device busy, attempting recovery...')
+                            import time
+                            
+                            # Strategy 1: Wait and retry with new API
+                            print('  Strategy 1: Waiting 3 seconds and retrying with new API...')
+                            time.sleep(3)
+                            try:
+                                device = torch_xla.device()
+                                print(f'✓ TPU device acquired (new API after wait): {device}')
+                                is_tpu = True
+                            except Exception:
+                                # Strategy 2: Wait longer and try old API
+                                print('  Strategy 2: Waiting 5 more seconds and trying old API...')
+                                time.sleep(5)
+                                try:
+                                    device = xm.xla_device()
+                                    print(f'✓ TPU device acquired (old API after wait): {device}')
+                                    is_tpu = True
+                                except Exception as e_retry:
+                                    print('⚠ TPU init failed after all retry strategies')
+                                    print(f'  Error: {str(e_retry)[:120]}')
+                                    print('  💡 Suggestion: Restart Colab runtime (Runtime → Restart runtime)')
+                                    print('  💡 Then re-run Cell 2 and Cell 5')
+                                    tpu_available = False
+                        else:
+                            print('⚠ TPU init failed')
+                            print(f'  New API: {str(e_new)[:120]}')
+                            print(f'  Old API: {str(e_old)[:120]}')
+                            tpu_available = False
         except Exception as e:
             print(f'⚠ TPU init exception: {str(e)[:200]}')
             tpu_available = False
