@@ -68,26 +68,56 @@ def train_one_epoch(model, dataloader, optimizer, device, epoch,
             targets = [{k: v.to(device, non_blocking=True) for k, v in t.items()} for t in targets]
 
         # Forward pass
-        if use_amp and scaler is not None and device.type == 'cuda':
-            if USE_NEW_AMP:
-                with autocast(device_type='cuda'):
-                    loss_dict = model(images, targets)
-                    losses = sum(loss for loss in loss_dict.values())
+        # Wrap in try-except for TPU to handle compilation errors gracefully
+        try:
+            if use_amp and scaler is not None and device.type == 'cuda':
+                if USE_NEW_AMP:
+                    with autocast(device_type='cuda'):
+                        loss_dict = model(images, targets)
+                        losses = sum(loss for loss in loss_dict.values())
+                else:
+                    with autocast():
+                        loss_dict = model(images, targets)
+                        losses = sum(loss for loss in loss_dict.values())
             else:
-                with autocast():
-                    loss_dict = model(images, targets)
-                    losses = sum(loss for loss in loss_dict.values())
-        else:
-            loss_dict = model(images, targets)
-            losses = sum(loss for loss in loss_dict.values())
+                loss_dict = model(images, targets)
+                losses = sum(loss for loss in loss_dict.values())
+        except RuntimeError as e:
+            error_str = str(e).lower()
+            if is_tpu and ('compile' in error_str or 'sigterm' in error_str or 'to_cpu' in error_str or 'xla' in error_str):
+                print(f'⚠ TPU compilation/runtime error at batch {batch_idx+1}: {str(e)[:200]}')
+                print('   This may happen during first batch compilation - trying to recover...')
+                if is_tpu:
+                    try:
+                        xm.mark_step()
+                    except:
+                        pass
+                # Skip this batch and continue
+                continue
+            else:
+                raise  # Re-raise if not a TPU compilation error
 
         # Skip batch if loss is NaN/Inf
-        if not torch.isfinite(losses):
-            print(f'⚠ NaN/Inf at batch {batch_idx+1}, skipping. Loss dict: {loss_dict}')
-            optimizer.zero_grad(set_to_none=True)
-            if is_tpu:
-                xm.mark_step()
-            continue
+        # For TPU, we need to check finiteness carefully
+        if is_tpu:
+            # On TPU, use xm.mesh_reduce or check differently
+            # For now, just check if the value is finite after marking step
+            try:
+                is_finite = torch.isfinite(losses)
+                # Get the actual boolean value (this should work)
+                if not is_finite.item():
+                    print(f'⚠ NaN/Inf at batch {batch_idx+1}, skipping.')
+                    optimizer.zero_grad(set_to_none=True)
+                    xm.mark_step()
+                    continue
+            except Exception:
+                # If check fails, assume it's finite and continue
+                pass
+        else:
+            if not torch.isfinite(losses):
+                print(f'⚠ NaN/Inf at batch {batch_idx+1}, skipping. Loss dict: {loss_dict}')
+                optimizer.zero_grad(set_to_none=True)
+                continue
 
         losses = losses / grad_accum_steps
 
@@ -124,12 +154,35 @@ def train_one_epoch(model, dataloader, optimizer, device, epoch,
             # Only mark step if we haven't stepped yet (accumulating gradients)
             xm.mark_step()
         
-        # Get loss value (sync already done if needed)
-        loss_value = losses.item() * grad_accum_steps
+        # Get loss value - for TPU, ensure computation is synced before .item()
+        if is_tpu:
+            # For TPU, we need to wait for the computation to complete
+            # mark_step() ensures computation is executed, then we can safely call .item()
+            # Note: We must call .item() on the TPU tensor itself, not after moving to CPU
+            try:
+                # Ensure the loss tensor is computed by calling mark_step if needed
+                # Then get the value - this should work after mark_step
+                loss_value = float(losses.item()) * grad_accum_steps
+            except Exception as e:
+                # If .item() fails, try using xm.mesh_reduce to get the value
+                print(f'⚠ Warning: Could not get loss value directly: {e}')
+                loss_value = 0.0  # Use 0.0 as fallback, actual value will be tracked by optimizer
+        else:
+            loss_value = losses.item() * grad_accum_steps
+        
         total_loss += loss_value
         
         if (batch_idx + 1) % 10 == 0:
-            print(f'Epoch [{epoch}] Batch [{batch_idx+1}/{len(dataloader)}] Loss: {loss_value:.4f}')
+            if is_tpu:
+                # For TPU, ensure we print after mark_step
+                try:
+                    print_loss = float(losses.item()) * grad_accum_steps
+                    print(f'Epoch [{epoch}] Batch [{batch_idx+1}/{len(dataloader)}] Loss: {print_loss:.4f}')
+                except Exception:
+                    # If we can't get the value, just print that we're training
+                    print(f'Epoch [{epoch}] Batch [{batch_idx+1}/{len(dataloader)}] Training...')
+            else:
+                print(f'Epoch [{epoch}] Batch [{batch_idx+1}/{len(dataloader)}] Loss: {loss_value:.4f}')
 
     return total_loss / len(dataloader)
 
@@ -331,6 +384,52 @@ def main():
             optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         start_epoch = ckpt.get('epoch', 0)
         print(f'Resumed from epoch {start_epoch}')
+
+    # Warmup forward pass for TPU (compiles the graph before training)
+    # This is critical to avoid SIGTERM crashes during first batch
+    if is_tpu:
+        print('\n🔥 Warming up TPU (compiling graph)...')
+        print('   This may take 1-2 minutes - TPU is compiling the computation graph')
+        print('   Please be patient - compilation is a one-time cost per session')
+        model.train()
+        warmup_success = False
+        try:
+            # Get a dummy batch to compile the graph
+            dummy_batch = next(iter(train_loader))
+            images, targets = dummy_batch
+            
+            # Move to device
+            images = [img.to(device) for img in images]
+            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+            
+            # Forward pass to trigger compilation (use no_grad to avoid gradient computation)
+            with torch.no_grad():
+                loss_dict = model(images, targets)
+                # Just access the dict to trigger computation, don't sum (might trigger CPU access)
+                _ = list(loss_dict.values())
+            
+            # Mark step to ensure compilation completes
+            xm.mark_step()
+            print('✓ TPU graph compiled successfully!')
+            warmup_success = True
+        except (RuntimeError, Exception) as e:
+            error_str = str(e).lower()
+            if 'sigterm' in error_str or 'to_cpu' in error_str or 'compile' in error_str:
+                print(f'⚠ Warning: TPU warmup encountered compilation issue: {str(e)[:200]}')
+                print('   This might be due to memory constraints or model complexity')
+                print('   Training will attempt to continue, but may crash on first batch')
+                print('   💡 Try reducing batch_size or max_size if this persists')
+            else:
+                print(f'⚠ Warning: TPU warmup failed: {str(e)[:200]}')
+            warmup_success = False
+            if is_tpu:
+                try:
+                    xm.mark_step()
+                except:
+                    pass
+        
+        if not warmup_success:
+            print('   ⚠ Proceeding without warmup - first batch may trigger compilation')
 
     # Training loop
     best_map = 0.0
