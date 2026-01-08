@@ -97,24 +97,39 @@ def train_one_epoch(model, dataloader, optimizer, device, epoch,
         else:
             losses.backward()
 
-        # Step on accumulation boundary or last batch
+            # Step on accumulation boundary or last batch
         if (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1) == len(dataloader):
-            if use_amp and scaler is not None and device.type == 'cuda':
+            if use_amp and scaler is not None and not is_tpu and device.type == 'cuda':
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                optimizer.step()
+                # For TPU, standard optimizer.step() works with mark_step()
+                if is_tpu:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    optimizer.step()
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    optimizer.step()
 
             optimizer.zero_grad(set_to_none=True)
             if is_tpu:
                 xm.mark_step()
 
-        total_loss += losses.item() * grad_accum_steps
+        # Accumulate loss (need to sync for TPU before calling .item())
+        # Note: mark_step() was already called after optimizer step if we did a step
+        # But if we didn't step (gradient accumulation), we need to sync before .item()
+        if is_tpu and (batch_idx + 1) % grad_accum_steps != 0:
+            # Only mark step if we haven't stepped yet (accumulating gradients)
+            xm.mark_step()
+        
+        # Get loss value (sync already done if needed)
+        loss_value = losses.item() * grad_accum_steps
+        total_loss += loss_value
+        
         if (batch_idx + 1) % 10 == 0:
-            print(f'Epoch [{epoch}] Batch [{batch_idx+1}/{len(dataloader)}] Loss: {losses.item() * grad_accum_steps:.4f}')
+            print(f'Epoch [{epoch}] Batch [{batch_idx+1}/{len(dataloader)}] Loss: {loss_value:.4f}')
 
     return total_loss / len(dataloader)
 
@@ -123,7 +138,7 @@ def main():
     parser = argparse.ArgumentParser(description='Train SGGF-Net on TPU')
     parser.add_argument('--dataset', type=str, default='hituav', choices=['visdrone', 'aitod', 'hituav'])
     parser.add_argument('--data_dir', type=str, default='data/hit-uav', help='Path to dataset root')
-    parser.add_argument('--num_classes', type=int, default=11, help='Number of classes')
+    parser.add_argument('--num_classes', type=int, default=6, help='Number of classes (HIT-UAV: 6, VisDrone: 11, AI-TOD: 9)')
     parser.add_argument('--batch_size', type=int, default=16, help='Batch size (TPU v5e-1: 16-32)')
     parser.add_argument('--num_epochs', type=int, default=50, help='Number of epochs')
     parser.add_argument('--lr', type=float, default=0.0005, help='Learning rate')
@@ -218,11 +233,17 @@ def main():
     )
 
     # Wrap DataLoader for TPU
-    if is_tpu and device.type == 'xla':
+    # Check if device is XLA device (hasattr check works for both old and new APIs)
+    if is_tpu:
         try:
-            train_loader = pl.MpDeviceLoader(train_loader, device)
-            val_loader = pl.MpDeviceLoader(val_loader, device)
-            print('✓ Using MpDeviceLoader')
+            # Check if device is XLA (either by type or by checking if it's an XLA device)
+            is_xla_device = hasattr(device, 'index') or str(device).startswith('xla:') or 'xla' in str(type(device)).lower()
+            if is_xla_device:
+                train_loader = pl.MpDeviceLoader(train_loader, device)
+                val_loader = pl.MpDeviceLoader(val_loader, device)
+                print('✓ Using MpDeviceLoader')
+            else:
+                print(f'⚠ Device {device} is not recognized as XLA device')
         except Exception as e:
             print(f'⚠ MpDeviceLoader failed: {e}')
             print('⚠ Using standard DataLoader')
@@ -257,9 +278,19 @@ def main():
     start_epoch = 0
     if args.resume and os.path.exists(args.resume):
         print(f'Loading checkpoint: {args.resume}')
-        ckpt = torch.load(args.resume, map_location=device)
+        # Load checkpoint - use xm.load for TPU, torch.load for CPU/GPU
+        if is_tpu:
+            try:
+                ckpt = xm.load(args.resume)
+            except Exception:
+                # Fallback to torch.load if xm.load fails (e.g., checkpoint saved on GPU)
+                ckpt = torch.load(args.resume, map_location='cpu')
+        else:
+            ckpt = torch.load(args.resume, map_location=device)
+        
         model.load_state_dict(ckpt['model_state_dict'])
-        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        if 'optimizer_state_dict' in ckpt:
+            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         start_epoch = ckpt.get('epoch', 0)
         print(f'Resumed from epoch {start_epoch}')
 
@@ -298,7 +329,15 @@ def main():
                     outputs = model(images)
                     predictions.extend(outputs)
                     targets_list.extend(targets)
+                    
+                    # Mark step for TPU during validation
+                    if is_tpu:
+                        xm.mark_step()
 
+            # Sync TPU before metric calculation
+            if is_tpu:
+                xm.mark_step()
+            
             mAP = calculate_map(predictions, targets_list, args.num_classes)
             AP50 = calculate_ap50(predictions, targets_list, args.num_classes)
             precision, recall, f1 = calculate_precision_recall_f1(predictions, targets_list, args.num_classes)
@@ -306,16 +345,32 @@ def main():
             print(f'Val mAP: {mAP:.4f} AP50: {AP50:.4f} P: {precision:.4f} R: {recall:.4f} F1: {f1:.4f}')
             model.train()
 
-            # Save best
+            # Save best (sync TPU before saving)
             if mAP > best_map:
                 best_map = mAP
-                best_path = os.path.join(args.checkpoint_dir, 'best_model.pth')
+                best_path = os.path.join(args.checkpoint_dir, 'best.pth')
                 try:
-                    if is_tpu and device.type == 'xla':
-                        xm.save(model.state_dict(), best_path)
+                    if is_tpu:
+                        # Sync TPU before saving
+                        xm.mark_step()
+                        # Get state dict from all cores (only need rank 0, but sync first)
+                        state_dict = model.state_dict()
+                        # Save only on rank 0 to avoid conflicts
+                        try:
+                            # Try is_master_ordinal (new API)
+                            is_master = xm.is_master_ordinal()
+                        except AttributeError:
+                            # Fallback to get_ordinal (old API)
+                            is_master = (xm.get_ordinal() == 0)
+                        if is_master:
+                            xm.save(state_dict, best_path)
+                        # Sync all cores after save
+                        xm.mark_step()
+                        if is_master:
+                            print(f'✓ Saved best model (mAP: {best_map:.4f})')
                     else:
                         torch.save(model.state_dict(), best_path)
-                    print(f'✓ Saved best model (mAP: {best_map:.4f})')
+                        print(f'✓ Saved best model (mAP: {best_map:.4f})')
                 except Exception as e:
                     print(f'⚠ Save best failed: {e}')
         else:
@@ -332,11 +387,25 @@ def main():
             ckpt['metrics'] = metrics
 
         try:
-            if is_tpu and device.type == 'xla':
-                xm.save(ckpt, latest_path)
+            if is_tpu:
+                # Sync TPU before saving
+                xm.mark_step()
+                # Save only on rank 0 to avoid conflicts
+                try:
+                    # Try is_master_ordinal (new API)
+                    is_master = xm.is_master_ordinal()
+                except AttributeError:
+                    # Fallback to get_ordinal (old API)
+                    is_master = (xm.get_ordinal() == 0)
+                if is_master:
+                    xm.save(ckpt, latest_path)
+                # Sync all cores after save
+                xm.mark_step()
+                if is_master:
+                    print('✓ Saved latest checkpoint')
             else:
                 torch.save(ckpt, latest_path)
-            print('✓ Saved latest checkpoint')
+                print('✓ Saved latest checkpoint')
         except Exception as e:
             print(f'⚠ Save latest failed: {e}')
 
