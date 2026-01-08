@@ -20,9 +20,15 @@ try:
     import torch_xla
     import torch_xla.core.xla_model as xm
     import torch_xla.distributed.parallel_loader as pl
+    try:
+        import torch_xla.distributed.xla_multiprocessing as xmp
+        XMP_AVAILABLE = True
+    except ImportError:
+        XMP_AVAILABLE = False
     TPU_AVAILABLE = True
 except Exception:
     TPU_AVAILABLE = False
+    XMP_AVAILABLE = False
 
 # Add parent dir to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -187,7 +193,14 @@ def train_one_epoch(model, dataloader, optimizer, device, epoch,
     return total_loss / len(dataloader)
 
 
-def main():
+def main(rank=None):
+    """
+    Main training function
+    
+    Args:
+        rank: Process rank for multiprocessing (None = single process)
+              When using xmp.spawn(), this will be set automatically
+    """
     parser = argparse.ArgumentParser(description='Train SGGF-Net on TPU')
     parser.add_argument('--dataset', type=str, default='hituav', choices=['visdrone', 'aitod', 'hituav'])
     parser.add_argument('--data_dir', type=str, default='data/hit-uav', help='Path to dataset root')
@@ -202,7 +215,7 @@ def main():
     parser.add_argument('--max_size', type=int, default=800, help='Max image size')
     parser.add_argument('--checkpoint_dir', type=str, default='checkpoints', help='Checkpoint directory')
     parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint')
-    parser.add_argument('--use_amp', action='store_true', default=True, help='Use AMP')
+    parser.add_argument('--use_amp', action='store_true', default=False, help='Use AMP (CUDA only, NOT for TPU)')
     parser.add_argument('--no_amp', dest='use_amp', action='store_false', help='Disable AMP')
     parser.add_argument('--val_freq', type=int, default=5, help='Validate every N epochs')
     parser.add_argument('--multi_scale', action='store_true', default=False, help='Multi-scale training')
@@ -228,10 +241,37 @@ def main():
                 print('⚠ COLAB_TPU_ADDR not set, but checking if TPU is available...')
             
             try:
+                # IMPORTANT: Check if TPU is already initialized first
+                # If XLA_SHARD_ORDINAL is set, we're in multiprocessing mode
+                import os
+                is_multiprocess = 'XLA_SHARD_ORDINAL' in os.environ
+                
                 # Use device() which gets the device without forcing reinit
-                device = torch_xla.device()
-                print(f'✓ Using TPU device (new API): {device}')
+                # If multiprocessing is used, this will get the device for this rank
+                if rank is not None or is_multiprocess:
+                    # Multiprocessing mode - get device for this rank
+                    if rank is not None:
+                        device = xm.xla_device(rank)
+                    else:
+                        # Try to get rank from environment
+                        try:
+                            env_rank = int(os.environ.get('XLA_SHARD_ORDINAL', '0'))
+                            device = xm.xla_device(env_rank)
+                        except:
+                            device = xm.xla_device()
+                    print(f'✓ Using TPU device (multiprocessing, rank {rank or "auto"}): {device}')
+                else:
+                    # Single process mode - try new API first (doesn't force reinit)
+                    try:
+                        device = torch_xla.device()
+                        print(f'✓ Using TPU device (new API): {device}')
+                    except:
+                        # Fallback to old API
+                        device = xm.xla_device()
+                        print(f'✓ Using TPU device (old API): {device}')
                 is_tpu = True
+                
+                # Try to get world size / core count
                 try:
                     world_size = xm.xla_world_size()
                     print(f'✓ TPU cores: {world_size}')
@@ -240,11 +280,22 @@ def main():
                         world_size = torch_xla._XLAC._xla_get_replication_devices_count()
                         print(f'✓ TPU cores: {world_size}')
                     except Exception:
-                        print('✓ TPU initialized')
+                        # Try to get all devices
+                        try:
+                            devices = xm.get_xla_supported_devices()
+                            if len(devices) > 1:
+                                print(f'✓ TPU devices detected: {len(devices)} cores')
+                            else:
+                                print(f'✓ TPU initialized: {len(devices)} device(s)')
+                        except Exception:
+                            print('✓ TPU initialized')
             except Exception as e_new:
                     # Try old API as fallback
                     try:
-                        device = xm.xla_device()
+                        if rank is not None:
+                            device = xm.xla_device(rank)
+                        else:
+                            device = xm.xla_device()
                         print(f'✓ Using TPU device (old API): {device}')
                         is_tpu = True
                     except Exception as e_old:
@@ -258,7 +309,10 @@ def main():
                             print('  Strategy 1: Waiting 3 seconds and retrying with new API...')
                             time.sleep(3)
                             try:
-                                device = torch_xla.device()
+                                if rank is not None:
+                                    device = xm.xla_device(rank)
+                                else:
+                                    device = torch_xla.device()
                                 print(f'✓ TPU device acquired (new API after wait): {device}')
                                 is_tpu = True
                             except Exception:
@@ -266,14 +320,33 @@ def main():
                                 print('  Strategy 2: Waiting 5 more seconds and trying old API...')
                                 time.sleep(5)
                                 try:
-                                    device = xm.xla_device()
+                                    if rank is not None:
+                                        device = xm.xla_device(rank)
+                                    else:
+                                        device = xm.xla_device()
                                     print(f'✓ TPU device acquired (old API after wait): {device}')
                                     is_tpu = True
                                 except Exception as e_retry:
-                                    print('⚠ TPU init failed after all retry strategies')
-                                    print(f'  Error: {str(e_retry)[:120]}')
-                                    print('  💡 Suggestion: Restart Colab runtime (Runtime → Restart runtime)')
-                                    print('  💡 Then re-run Cell 2 and Cell 5')
+                                    print('\n' + '='*70)
+                                    print('❌ TPU INITIALIZATION FAILED')
+                                    print('='*70)
+                                    print(f'Error: {str(e_retry)[:200]}')
+                                    print('')
+                                    print('🔍 Cause: "Device or resource busy" means:')
+                                    print('  • TPU was already initialized in this session')
+                                    print('  • Previous process didn\'t release TPU properly')
+                                    print('  • Multiple processes trying to access TPU')
+                                    print('')
+                                    print('✅ SOLUTION (MUST DO THIS):')
+                                    print('  1. Runtime → Restart runtime (this clears TPU state)')
+                                    print('  2. Re-run Cell 0 (Mount Drive & Clone)')
+                                    print('  3. Re-run Cell 1 (Setup & Training)')
+                                    print('')
+                                    print('⚠ If this persists after restart:')
+                                    print('  • Wait 1-2 minutes after restart before running')
+                                    print('  • Make sure no other notebooks are using TPU')
+                                    print('  • Try single-process mode (remove --use_mp flag)')
+                                    print('='*70)
                                     tpu_available = False
                         else:
                             print('⚠ TPU init failed')
@@ -289,6 +362,42 @@ def main():
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f'✓ Using device: {device}')
         is_tpu = False
+        
+        # Safety check: Warn if using CPU with TPU-optimized settings
+        if device.type == 'cpu':
+            print('\n' + '='*70)
+            print('⚠ WARNING: Training on CPU with TPU-optimized settings!')
+            print('='*70)
+            print('CPU cannot handle these large settings and will likely crash.')
+            print(f'Current settings: batch_size={args.batch_size}, max_size={args.max_size}')
+            print('')
+            print('💡 Solutions:')
+            print('  1. Enable TPU: Runtime → Change runtime type → TPU → Restart')
+            print('  2. Use GPU instead (if available)')
+            print('  3. For CPU training, use train.py with smaller settings:')
+            print(f'     --batch_size 1 --max_size 416 --grad_accum_steps 1')
+            print('')
+            print('⚠ Proceeding with CPU training may crash due to memory issues.')
+            print('   Press Ctrl+C to cancel, or wait 5 seconds to continue anyway...')
+            print('='*70)
+            import time
+            try:
+                time.sleep(5)  # Give user time to cancel
+            except KeyboardInterrupt:
+                print('\n✓ Training cancelled by user')
+                print('💡 Please enable TPU or use train.py with CPU-safe settings')
+                return
+            
+            # Auto-reduce settings for CPU safety
+            if args.batch_size > 1 or args.max_size > 416:
+                print('\n🔧 Auto-adjusting settings for CPU safety...')
+                original_batch_size = args.batch_size
+                original_max_size = args.max_size
+                args.batch_size = 1
+                args.max_size = 416
+                print(f'   batch_size: {original_batch_size} → {args.batch_size}')
+                print(f'   max_size: {original_max_size} → {args.max_size}')
+                print('   (You can adjust these manually if needed)')
 
     # Checkpoint dir
     os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -403,12 +512,16 @@ def main():
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
             
             # Forward pass to trigger compilation (use no_grad to avoid gradient computation)
+            # IMPORTANT: Don't access loss_dict values at all - just call forward pass
+            # Any access to tensor values (even len() on dict) can trigger _to_cpu() and SIGTERM
+            # The forward pass itself will trigger XLA compilation without needing to access results
             with torch.no_grad():
-                loss_dict = model(images, targets)
-                # Just access the dict to trigger computation, don't sum (might trigger CPU access)
-                _ = list(loss_dict.values())
+                # Just call forward - don't store or access the result
+                # The compilation happens during the forward pass, not when accessing results
+                model(images, targets)
             
             # Mark step to ensure compilation completes
+            # This is critical - without mark_step, compilation might not complete
             xm.mark_step()
             print('✓ TPU graph compiled successfully!')
             warmup_success = True
@@ -552,5 +665,56 @@ def main():
     print('\nTraining completed!')
 
 
+def _mp_fn(rank, *args):
+    """Multiprocessing wrapper for TPU - spawns one process per TPU core"""
+    # Set environment variables for this rank
+    import os
+    os.environ['XLA_SHARD_ORDINAL'] = str(rank)
+    os.environ['XLA_SHARD_COUNT'] = '8'
+    # Call main with rank - main() will parse args itself
+    main(rank=rank)
+
+
 if __name__ == '__main__':
-    main()
+    # Parse args first to check if multiprocessing is requested
+    import argparse
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument('--use_mp', action='store_true', default=False)
+    args_quick, _ = parser.parse_known_args()
+    
+    # IMPORTANT: For TPU v5e-1 (8 cores), we need multiprocessing to use all cores
+    # However, in Colab, multiprocessing can cause "Device or resource busy" errors
+    # So we make it optional with --use_mp flag
+    
+    # Check if we should use multiprocessing for TPU
+    use_multiprocessing = args_quick.use_mp and TPU_AVAILABLE and XMP_AVAILABLE
+    
+    if use_multiprocessing:
+        print('🚀 Multiprocessing enabled: Will use all 8 TPU cores')
+        print('   Spawning 8 processes, one per TPU core')
+        try:
+            # Spawn 8 processes, one per TPU core
+            xmp.spawn(_mp_fn, args=(None,), nprocs=8, start_method='fork')
+        except Exception as e:
+            error_str = str(e).lower()
+            if 'device or resource busy' in error_str or 'iommu' in error_str:
+                print(f'⚠ Multiprocessing failed due to device busy: {str(e)[:200]}')
+                print('   This often happens in Colab when TPU is already initialized')
+                print('   Falling back to single-process mode')
+                print('   💡 To fix: Restart runtime, then re-run with --use_mp')
+            else:
+                print(f'⚠ Multiprocessing failed: {str(e)[:200]}')
+                print('   Falling back to single-process mode')
+            main(rank=None)
+    else:
+        # Single process mode (uses only 1 TPU core, but more stable)
+        if TPU_AVAILABLE:
+            try:
+                devices = xm.get_xla_supported_devices()
+                if len(devices) > 1:
+                    print(f'⚠ Running in single-process mode (using 1 of {len(devices)} TPU cores)')
+                    print(f'   To use all {len(devices)} cores, add --use_mp flag')
+                    print(f'   Example: --use_mp (may require runtime restart)')
+            except:
+                pass
+        main(rank=None)
