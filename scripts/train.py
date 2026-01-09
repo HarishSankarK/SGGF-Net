@@ -146,14 +146,36 @@ def validate(model, dataloader, device, num_classes):
     with torch.no_grad():
         for images, targets in dataloader:
             images = [img.to(device, non_blocking=True) for img in images]
+            # Move targets to device as well
+            targets = [{k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v 
+                       for k, v in t.items()} for t in targets]
             outputs = model(images)
             predictions.extend(outputs)
             targets_list.extend(targets)
     
-    # Calculate metrics
-    mAP = calculate_map(predictions, targets_list, num_classes, verbose=False)
-    AP50 = calculate_ap50(predictions, targets_list, num_classes, verbose=False)
-    precision, recall, f1 = calculate_precision_recall_f1(predictions, targets_list, num_classes)
+    # Move all predictions to CPU for metric calculation (more memory efficient)
+    # This ensures all tensors are on the same device
+    predictions_cpu = []
+    for pred in predictions:
+        pred_cpu = {
+            'boxes': pred['boxes'].cpu() if isinstance(pred['boxes'], torch.Tensor) else pred['boxes'],
+            'labels': pred['labels'].cpu() if isinstance(pred['labels'], torch.Tensor) else pred['labels'],
+            'scores': pred['scores'].cpu() if isinstance(pred['scores'], torch.Tensor) else pred['scores']
+        }
+        predictions_cpu.append(pred_cpu)
+    
+    targets_cpu = []
+    for target in targets_list:
+        target_cpu = {
+            'boxes': target['boxes'].cpu() if isinstance(target['boxes'], torch.Tensor) else target['boxes'],
+            'labels': target['labels'].cpu() if isinstance(target['labels'], torch.Tensor) else target['labels']
+        }
+        targets_cpu.append(target_cpu)
+    
+    # Calculate metrics (all tensors now on CPU)
+    mAP = calculate_map(predictions_cpu, targets_cpu, num_classes, verbose=False)
+    AP50 = calculate_ap50(predictions_cpu, targets_cpu, num_classes, verbose=False)
+    precision, recall, f1 = calculate_precision_recall_f1(predictions_cpu, targets_cpu, num_classes)
     
     return {
         'mAP': mAP,

@@ -17,6 +17,10 @@ def calculate_iou(boxes1, boxes2):
     Returns:
         IoU matrix of shape (N, M)
     """
+    # Ensure both tensors are on the same device
+    if boxes1.device != boxes2.device:
+        boxes2 = boxes2.to(boxes1.device)
+    
     # Convert to [x1, y1, x2, y2] format
     def to_corners(boxes):
         x_center, y_center, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
