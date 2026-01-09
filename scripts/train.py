@@ -104,14 +104,14 @@ def train_one_epoch(model, dataloader, optimizer, device, epoch, scaler=None, us
         if use_amp and scaler is not None:
             scaler.scale(loss).backward()
             # Gradient clipping
-            scaler.unscale_(optimizer)
+                scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
-            optimizer.step()
+                optimizer.step()
             
         # MPS: Sync and empty cache periodically
         if device.type == 'mps':
@@ -228,7 +228,7 @@ def main():
         use_amp = True
         print('✓ Using CUDA GPU')
     else:
-        device = torch.device('cpu')
+            device = torch.device('cpu')
         use_amp = False
         if torch.backends.mps.is_available():
             print('✓ Using CPU (MPS available but disabled due to memory crashes)')
@@ -369,9 +369,20 @@ def main():
         # weights_only=False is safe for our own checkpoints
         checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'])
-        start_epoch = checkpoint.get('epoch', 0) + 1
+        
+        # Only resume epoch if it's the same stage (for continuing training)
+        # Otherwise, start from epoch 0 for a new stage
+        checkpoint_stage = checkpoint.get('stage', None)
+        if checkpoint_stage == args.stage:
+            start_epoch = checkpoint.get('epoch', 0) + 1
+            print(f"  Resuming Stage {args.stage} from epoch {start_epoch}", flush=True)
+        else:
+            start_epoch = 0
+            print(f"  Starting new Stage {args.stage} (checkpoint was from Stage {checkpoint_stage})", flush=True)
+        
+        # Always use the best mAP from the checkpoint as baseline
         best_map = checkpoint.get('metrics', {}).get('mAP', 0.0)
-        print(f"  Resumed from epoch {start_epoch}, best mAP: {best_map:.4f}\n", flush=True)
+        print(f"  Best mAP from checkpoint: {best_map:.4f}\n", flush=True)
     
     # Optimizer and scheduler
     optimizer = AdamW(
@@ -389,7 +400,7 @@ def main():
             scaler = None
             use_amp = False
             print("⚠ MPS: Mixed precision disabled (memory issues)")
-        else:
+            else:
             scaler = None
             use_amp = False
     else:
@@ -411,7 +422,20 @@ def main():
     # Training loop
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     
-    print(f"\nStarting training for {config['num_epochs']} epochs...\n", flush=True)
+    # Safety check: Ensure start_epoch is valid
+    if start_epoch >= config['num_epochs']:
+        print(f"\n⚠ WARNING: start_epoch ({start_epoch}) >= num_epochs ({config['num_epochs']})", flush=True)
+        print(f"  Resetting start_epoch to 0 for new stage training", flush=True)
+        start_epoch = 0
+    
+    print(f"\nStarting training for {config['num_epochs']} epochs (starting from epoch {start_epoch})...\n", flush=True)
+    
+    # Additional safety: Check if training loop will actually run
+    if start_epoch >= config['num_epochs']:
+        print(f"\n❌ ERROR: Cannot start training - start_epoch ({start_epoch}) >= num_epochs ({config['num_epochs']})", flush=True)
+        print(f"  This usually happens when resuming from a different stage.", flush=True)
+        print(f"  Please check your checkpoint and stage configuration.", flush=True)
+        sys.exit(1)
     
     for epoch in range(start_epoch, config['num_epochs']):
         print(f"Epoch [{epoch+1}/{config['num_epochs']}]", flush=True)
