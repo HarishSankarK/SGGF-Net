@@ -65,7 +65,7 @@ def calculate_ap(recalls, precisions):
     return ap
 
 
-def calculate_map(predictions, targets, num_classes, iou_thresholds=[0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]):
+def calculate_map(predictions, targets, num_classes, iou_thresholds=[0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95], verbose=False):
     """
     Calculate mean Average Precision (mAP)
     
@@ -74,80 +74,112 @@ def calculate_map(predictions, targets, num_classes, iou_thresholds=[0.5, 0.55, 
         targets: List of dicts with 'boxes', 'labels'
         num_classes: Number of classes
         iou_thresholds: List of IoU thresholds for AP calculation
+        verbose: Print progress messages
     Returns:
         mAP value
     """
     aps = []
+    num_thresholds = len(iou_thresholds)
+    num_class_loops = num_classes - 1  # Skip background
     
-    for iou_thresh in iou_thresholds:
+    for thresh_idx, iou_thresh in enumerate(iou_thresholds):
+        if verbose:
+            print(f'  Calculating AP at IoU={iou_thresh:.2f} ({thresh_idx+1}/{num_thresholds})...')
+        
         class_aps = []
         
         for class_id in range(1, num_classes):  # Skip background
-            # Collect predictions and targets for this class
-            pred_boxes = []
-            pred_scores = []
-            gt_boxes = []
+            if verbose and num_class_loops > 3:
+                print(f'    Class {class_id}/{num_classes-1}...', end=' ', flush=True)
             
-            for pred, target in zip(predictions, targets):
+            # Collect predictions and targets for this class, grouped by image
+            pred_boxes_by_img = []
+            pred_scores_by_img = []
+            gt_boxes_by_img = []
+            
+            for img_idx, (pred, target) in enumerate(zip(predictions, targets)):
                 # Get predictions for this class
                 class_mask = pred['labels'] == class_id
                 if class_mask.any():
-                    pred_boxes.append(pred['boxes'][class_mask])
-                    pred_scores.append(pred['scores'][class_mask])
+                    pred_boxes_by_img.append(pred['boxes'][class_mask])
+                    pred_scores_by_img.append(pred['scores'][class_mask])
                 else:
-                    pred_boxes.append(torch.zeros(0, 4))
-                    pred_scores.append(torch.zeros(0))
+                    pred_boxes_by_img.append(torch.zeros(0, 4))
+                    pred_scores_by_img.append(torch.zeros(0))
                 
                 # Get ground truth for this class
                 gt_mask = target['labels'] == class_id
                 if gt_mask.any():
-                    gt_boxes.append(target['boxes'][gt_mask])
+                    gt_boxes_by_img.append(target['boxes'][gt_mask])
                 else:
-                    gt_boxes.append(torch.zeros(0, 4))
+                    gt_boxes_by_img.append(torch.zeros(0, 4))
             
             # Calculate AP for this class
-            if len(pred_boxes) > 0:
+            # Collect all predictions with their image indices
+            all_pred_boxes = []
+            all_pred_scores = []
+            pred_img_indices = []  # Track which image each prediction belongs to
+            
+            for img_idx, (pred_boxes, pred_scores) in enumerate(zip(pred_boxes_by_img, pred_scores_by_img)):
+                if len(pred_boxes) > 0:
+                    all_pred_boxes.append(pred_boxes)
+                    all_pred_scores.append(pred_scores)
+                    pred_img_indices.extend([img_idx] * len(pred_boxes))
+            
+            if len(all_pred_boxes) > 0:
                 # Flatten predictions
-                all_pred_boxes = torch.cat(pred_boxes, dim=0)
-                all_pred_scores = torch.cat(pred_scores, dim=0)
+                all_pred_boxes = torch.cat(all_pred_boxes, dim=0)
+                all_pred_scores = torch.cat(all_pred_scores, dim=0)
                 
                 # Sort by score
                 sorted_indices = torch.argsort(all_pred_scores, descending=True)
                 all_pred_boxes = all_pred_boxes[sorted_indices]
                 all_pred_scores = all_pred_scores[sorted_indices]
+                pred_img_indices = [pred_img_indices[i] for i in sorted_indices]
                 
-                # Match predictions to ground truth
+                # Match predictions to ground truth (WITHIN THE SAME IMAGE)
                 tp = torch.zeros(len(all_pred_boxes))
                 fp = torch.zeros(len(all_pred_boxes))
                 
-                gt_matched = [torch.zeros(len(gt), dtype=torch.bool) for gt in gt_boxes]
+                gt_matched = [torch.zeros(len(gt), dtype=torch.bool) for gt in gt_boxes_by_img]
                 
-                for i, pred_box in enumerate(all_pred_boxes):
-                    # Find best matching GT
-                    best_iou = 0
-                    best_gt_idx = -1
-                    best_img_idx = -1
+                # Process predictions in batches for progress tracking
+                total_preds = len(all_pred_boxes)
+                batch_size_progress = max(1, total_preds // 10) if verbose and total_preds > 100 else total_preds
+                
+                for i, (pred_box, img_idx) in enumerate(zip(all_pred_boxes, pred_img_indices)):
+                    # Only match to GT in the same image
+                    img_gt_boxes = gt_boxes_by_img[img_idx]
                     
-                    for img_idx, img_gt_boxes in enumerate(gt_boxes):
-                        if len(img_gt_boxes) > 0:
-                            ious = calculate_iou(pred_box.unsqueeze(0), img_gt_boxes)
-                            max_iou, gt_idx = ious.max(dim=1)
-                            if max_iou.item() > best_iou:
-                                best_iou = max_iou.item()
-                                best_gt_idx = gt_idx.item()
-                                best_img_idx = img_idx
-                    
-                    if best_iou >= iou_thresh and not gt_matched[best_img_idx][best_gt_idx]:
-                        tp[i] = 1
-                        gt_matched[best_img_idx][best_gt_idx] = True
+                    if len(img_gt_boxes) > 0:
+                        # Calculate IoU with GT boxes in this image only
+                        ious = calculate_iou(pred_box.unsqueeze(0), img_gt_boxes)
+                        max_iou, gt_idx = ious.max(dim=1)
+                        max_iou_val = max_iou.item()
+                        gt_idx_val = gt_idx.item()
+                        
+                        # Check if this GT box is already matched
+                        if max_iou_val >= iou_thresh and not gt_matched[img_idx][gt_idx_val]:
+                            tp[i] = 1
+                            gt_matched[img_idx][gt_idx_val] = True
+                        else:
+                            fp[i] = 1
                     else:
+                        # No GT boxes in this image -> FP
                         fp[i] = 1
+                    
+                    # Progress update
+                    if verbose and (i + 1) % batch_size_progress == 0:
+                        print(f'{i+1}/{total_preds}', end=' ', flush=True)
+                
+                if verbose and num_class_loops > 3:
+                    print()  # New line after progress
                 
                 # Calculate precision and recall
                 tp_cumsum = torch.cumsum(tp, dim=0)
                 fp_cumsum = torch.cumsum(fp, dim=0)
                 
-                total_gt = sum(len(gt) for gt in gt_boxes)
+                total_gt = sum(len(gt) for gt in gt_boxes_by_img)
                 recalls = (tp_cumsum / total_gt).numpy() if total_gt > 0 else np.zeros(len(tp))
                 precisions = (tp_cumsum / (tp_cumsum + fp_cumsum + 1e-6)).numpy()
                 
@@ -164,9 +196,9 @@ def calculate_map(predictions, targets, num_classes, iou_thresholds=[0.5, 0.55, 
     return np.mean(aps)
 
 
-def calculate_ap50(predictions, targets, num_classes):
+def calculate_ap50(predictions, targets, num_classes, verbose=False):
     """Calculate AP at IoU threshold 0.5"""
-    return calculate_map(predictions, targets, num_classes, iou_thresholds=[0.5])
+    return calculate_map(predictions, targets, num_classes, iou_thresholds=[0.5], verbose=verbose)
 
 
 def calculate_precision_recall_f1(predictions, targets, num_classes, iou_threshold=0.5):
@@ -213,4 +245,3 @@ def calculate_precision_recall_f1(predictions, targets, num_classes, iou_thresho
     f1 = 2 * (precision * recall) / (precision + recall + 1e-6)
     
     return precision, recall, f1
-

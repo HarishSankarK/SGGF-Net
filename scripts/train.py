@@ -1,30 +1,24 @@
 """
-Training script for SGGF-Net
+Streamlined Training Script for SGGF-Net (M1 Optimized)
+3-Stage Training: Baseline → GFEM → NDPA+ARPM
+Target: ~60 minutes total training time
 """
 
 import os
 import sys
 import argparse
-import math
+import random
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
-from torch.optim import SGD
-import torch.optim.lr_scheduler as lr_scheduler
-try:
-    # PyTorch 2.0+ uses torch.amp
-    from torch.amp import autocast, GradScaler
-    USE_NEW_AMP = True
-except ImportError:
-    # Fallback for older PyTorch versions
-    from torch.cuda.amp import autocast, GradScaler
-    USE_NEW_AMP = False
+from torch.utils.data import DataLoader, Subset
+from torch.optim import AdamW
+import numpy as np
 
 # Add parent directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from models import SGGFNet
-from utils import VisDroneDataset, AITODDataset, HITUAVDataset, get_train_transform, get_val_transform
+from utils import HITUAVDataset, get_train_transform, get_val_transform
 from utils.metrics import calculate_map, calculate_ap50, calculate_precision_recall_f1
 
 
@@ -35,75 +29,112 @@ def collate_fn(batch):
     return images, targets
 
 
-def train_one_epoch(model, dataloader, optimizer, device, epoch, scaler=None, use_amp=False, 
-                   max_grad_norm=10.0, grad_accum_steps=1):
-    """Train for one epoch with optional mixed precision and gradient accumulation"""
+def freeze_backbone_early_layers(model):
+    """Freeze ResNet early layers (layer0, layer1, layer2) for transfer learning"""
+    for name, param in model.backbone.named_parameters():
+        if 'layer0' in name or 'layer1' in name or 'layer2' in name:
+            param.requires_grad = False
+    print("✓ Frozen ResNet layers: layer0, layer1, layer2")
+
+
+def freeze_except(model, module_names):
+    """Freeze all parameters except specified modules"""
+    # Freeze everything first
+    for param in model.parameters():
+        param.requires_grad = False
+    
+    # Unfreeze specified modules
+    for name in module_names:
+        for param in getattr(model, name).parameters():
+            param.requires_grad = True
+    print(f"✓ Training only: {', '.join(module_names)}")
+
+
+def train_one_epoch(model, dataloader, optimizer, device, epoch, scaler=None, use_amp=False):
+    """Train for one epoch"""
     model.train()
     total_loss = 0.0
+    num_batches = 0
+    
+    # MPS: non_blocking doesn't work well, disable it
+    non_blocking = device.type == 'cuda'
+    
+    print(f'  Total batches: {len(dataloader)}')
+    if device.type == 'cpu':
+        print('  ⚠ CPU training is slow - please be patient!')
+        print('  💡 For faster training, use Google Colab (T4 GPU)')
     
     for batch_idx, (images, targets) in enumerate(dataloader):
-        # Move to device (non-blocking for faster transfer)
-        images = [img.to(device, non_blocking=True) for img in images]
-        targets = [{k: v.to(device, non_blocking=True) for k, v in t.items()} for t in targets]
+        # Progress update (CPU is very slow, provide frequent updates)
+        if device.type == 'cpu':
+            if batch_idx == 0:
+                print(f'  Loading first batch (batch 1/{len(dataloader)})...')
+                print('  ⏳ This may take 1-2 minutes on CPU (please wait)')
+            elif batch_idx < 3:
+                print(f'  Processing batch {batch_idx+1}/{len(dataloader)}...')
         
-        # Forward pass with mixed precision if enabled
-        if use_amp and scaler is not None:
-            # Use device-specific autocast (PyTorch 2.0+) or legacy autocast
-            if USE_NEW_AMP and device.type == 'cuda':
-                with autocast(device_type='cuda'):
-                    loss_dict = model(images, targets)
-                    losses = sum(loss for loss in loss_dict.values())
-            elif not USE_NEW_AMP and device.type == 'cuda':
-                with autocast():
-                    loss_dict = model(images, targets)
-                    losses = sum(loss for loss in loss_dict.values())
-            else:
+        images = [img.to(device, non_blocking=non_blocking) for img in images]
+        targets = [{k: v.to(device, non_blocking=non_blocking) for k, v in t.items()} for t in targets]
+        
+        if device.type == 'cpu' and batch_idx == 0:
+            print('  ⏳ Running forward pass (this is the slowest part on CPU)...')
+        
+        optimizer.zero_grad()
+        
+        # Forward pass (MPS: no AMP due to memory issues)
+        if use_amp and device.type == 'cuda':
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
                 loss_dict = model(images, targets)
-                losses = sum(loss for loss in loss_dict.values())
+                loss = sum(loss for loss in loss_dict.values())
         else:
-            # Standard precision
+            # Standard precision (MPS or CPU)
             loss_dict = model(images, targets)
-            losses = sum(loss for loss in loss_dict.values())
+            loss = sum(loss for loss in loss_dict.values())
         
-        # CRITICAL FIX: Skip batch if loss is NaN/Inf (prevents training crash)
-        if not torch.isfinite(losses):
-            print(f'⚠ Warning: NaN/Inf loss detected at batch {batch_idx+1}. Skipping this batch.')
-            print(f'   Loss breakdown: {loss_dict}')
-            optimizer.zero_grad(set_to_none=True)
+        if device.type == 'cpu' and batch_idx == 0:
+            print(f'  ✓ Forward pass completed! Loss: {loss.item():.4f}')
+            print('  ⚠ CPU training is ~10x slower than GPU. Consider using Colab for faster training.')
+        
+        # Skip NaN/Inf
+        if not torch.isfinite(loss):
+            print(f'⚠ Warning: NaN/Inf loss at batch {batch_idx+1}, skipping')
             continue
         
-        # Scale loss for gradient accumulation
-        losses = losses / grad_accum_steps
-        
-        # Backward pass with gradient scaling
+        # Backward
         if use_amp and scaler is not None:
-            scaler.scale(losses).backward()
+            scaler.scale(loss).backward()
+            # Gradient clipping
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+            scaler.step(optimizer)
+            scaler.update()
         else:
-            losses.backward()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+            optimizer.step()
         
-        # Update optimizer only after accumulating gradients
-        if (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1) == len(dataloader):
-            if use_amp and scaler is not None:
-                # Gradient clipping before optimizer step
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                
-                optimizer.step()
-            
-            optimizer.zero_grad(set_to_none=True)
+        # MPS: Sync and empty cache periodically
+        if device.type == 'mps':
+            if (batch_idx + 1) % 50 == 0:
+                try:
+                    torch.mps.empty_cache()
+                except Exception:
+                    pass  # Ignore cache errors on MPS
         
-        total_loss += losses.item() * grad_accum_steps  # Scale back for reporting
+        total_loss += loss.item()
+        num_batches += 1
         
-        if (batch_idx + 1) % 10 == 0:
-            print(f'Epoch [{epoch}], Batch [{batch_idx+1}/{len(dataloader)}], Loss: {losses.item() * grad_accum_steps:.4f}')
+        # Progress updates: more frequent on CPU (it's slow), less frequent on GPU
+        if device.type == 'cpu':
+            # CPU: Print every 10 batches or every batch for first 10
+            if batch_idx < 10 or (batch_idx + 1) % 10 == 0:
+                print(f'  Batch [{batch_idx+1}/{len(dataloader)}], Loss: {loss.item():.4f}')
+        else:
+            # GPU: Print every 50 batches
+            if (batch_idx + 1) % 50 == 0:
+                print(f'  Batch [{batch_idx+1}/{len(dataloader)}], Loss: {loss.item():.4f}')
     
-    return total_loss / len(dataloader)
+    return total_loss / max(num_batches, 1)
 
 
 def validate(model, dataloader, device, num_classes):
@@ -114,16 +145,14 @@ def validate(model, dataloader, device, num_classes):
     
     with torch.no_grad():
         for images, targets in dataloader:
-            images = [img.to(device) for img in images]
-            
-            # Get predictions
+            images = [img.to(device, non_blocking=True) for img in images]
             outputs = model(images)
             predictions.extend(outputs)
             targets_list.extend(targets)
     
     # Calculate metrics
-    mAP = calculate_map(predictions, targets_list, num_classes)
-    AP50 = calculate_ap50(predictions, targets_list, num_classes)
+    mAP = calculate_map(predictions, targets_list, num_classes, verbose=False)
+    AP50 = calculate_ap50(predictions, targets_list, num_classes, verbose=False)
     precision, recall, f1 = calculate_precision_recall_f1(predictions, targets_list, num_classes)
     
     return {
@@ -135,204 +164,257 @@ def validate(model, dataloader, device, num_classes):
     }
 
 
+def create_subset_dataset(dataset, subset_ratio=0.35, seed=42):
+    """Create a random subset of the dataset"""
+    total_size = len(dataset)
+    subset_size = int(total_size * subset_ratio)
+    
+    random.seed(seed)
+    np.random.seed(seed)
+    indices = random.sample(range(total_size), subset_size)
+    
+    print(f"✓ Using {subset_size}/{total_size} samples ({subset_ratio*100:.0f}% of dataset)")
+    return Subset(dataset, indices)
+
+
 def main():
-    parser = argparse.ArgumentParser(description='Train SGGF-Net')
-    parser.add_argument('--dataset', type=str, default='visdrone', choices=['visdrone', 'aitod', 'hituav'],
-                        help='Dataset to use')
-    parser.add_argument('--data_dir', type=str, default='data/hit-uav', help='Path to dataset root (default: data/hit-uav)')
-    parser.add_argument('--num_classes', type=int, default=11, help='Number of classes')
-    parser.add_argument('--batch_size', type=int, default=2, help='Batch size')
-    parser.add_argument('--num_epochs', type=int, default=50, help='Number of epochs')
-    parser.add_argument('--lr', type=float, default=0.0005, help='Learning rate (default: 0.0005, optimized for stability)')
-    parser.add_argument('--grad_accum_steps', type=int, default=1, help='Gradient accumulation steps (default: 1, use 2 for effective batch_size=4)')
-    parser.add_argument('--warmup_epochs', type=int, default=5, help='Warmup epochs for learning rate (default: 5)')
-    parser.add_argument('--momentum', type=float, default=0.9, help='Momentum')
-    parser.add_argument('--weight_decay', type=float, default=0.0001, help='Weight decay')
-    parser.add_argument('--max_size', type=int, default=1024, 
-                        help='Max image size (default: 1024, use 1536 only if you have enough GPU memory)')
-    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints', help='Checkpoint directory (use Drive path in Colab)')
-    parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint (can be Drive path)')
-    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
-                        help='Device to use')
-    parser.add_argument('--use_amp', action='store_true', default=True,
-                        help='Use Automatic Mixed Precision (AMP) for faster training (default: True)')
-    parser.add_argument('--no_amp', dest='use_amp', action='store_false',
-                        help='Disable AMP (use full precision)')
-    parser.add_argument('--compile', action='store_true', default=False,
-                        help='Use torch.compile for faster training (PyTorch 2.0+, default: False)')
-    parser.add_argument('--val_freq', type=int, default=5,
-                        help='Validate every N epochs (default: 5, set to 1 for every epoch)')
-    parser.add_argument('--multi_scale', action='store_true', default=False,
-                        help='Enable multi-scale training (randomly sample from [1024, 1280, 1536])')
+    parser = argparse.ArgumentParser(description='Train SGGF-Net (Staged Training for M1)')
+    parser.add_argument('--data_dir', type=str, default='data/hit-uav', help='Dataset directory')
+    parser.add_argument('--num_classes', type=int, default=6, help='Number of classes')
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints', help='Checkpoint directory')
+    parser.add_argument('--stage', type=int, default=1, choices=[1, 2, 3], 
+                       help='Training stage: 1=Baseline, 2=GFEM, 3=NDPA+ARPM')
+    parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint')
+    parser.add_argument('--subset_ratio', type=float, default=0.35, help='Training subset ratio (0.35 = 35%%)')
     
     args = parser.parse_args()
     
-    # Create checkpoint directory (works for both local and Drive paths)
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
-    print(f'Checkpoint directory: {args.checkpoint_dir}')
+    # Device setup - MPS has critical memory issues on M1, use CPU instead
+    # MPS crashes with "Failed to allocate IOGPUDeviceShmem" - it's too unreliable
+    # CPU is slower but stable (2-3 hours vs crashes)
+    force_mps = os.environ.get('USE_MPS', '0').lower() in ['1', 'true', 'yes']
     
-    # Device with CUDA verification
-    if args.device == 'cuda':
-        if not torch.cuda.is_available():
-            print('⚠ CUDA requested but not available. Falling back to CPU.')
-            print('⚠ To use GPU, run Step 2 in the notebook to install CUDA PyTorch.')
-            device = torch.device('cpu')
-        else:
-            device = torch.device('cuda')
-            print(f'✓ Using device: {device}')
-            print(f'✓ CUDA device: {torch.cuda.get_device_name(0)}')
+    if torch.backends.mps.is_available() and force_mps:
+        # Only use MPS if explicitly requested (NOT RECOMMENDED - will likely crash)
+        device = torch.device('mps')
+        use_amp = False
+        print('⚠⚠⚠ Using MPS (NOT RECOMMENDED - likely to crash!) ⚠⚠⚠')
+        print('  MPS crashes with "IOGPUDeviceShmem" errors on complex models')
+        print('  If you encounter crashes, remove USE_MPS=1 to use CPU')
+    elif torch.cuda.is_available():
+        device = torch.device('cuda')
+        use_amp = True
+        print('✓ Using CUDA GPU')
     else:
-        device = torch.device(args.device)
-        print(f'Using device: {device}')
+        device = torch.device('cpu')
+        use_amp = False
+        if torch.backends.mps.is_available():
+            print('✓ Using CPU (MPS available but disabled due to memory crashes)')
+            print('  MPS fails with "IOGPUDeviceShmem" errors on M1 - CPU is stable')
+            print('  Training will take ~2-3 hours on CPU (but it will complete!)')
+        else:
+            print('✓ Using CPU')
     
-    # Dataset with optional multi-scale training
-    train_transform = get_train_transform(max_size=args.max_size, multi_scale=args.multi_scale)
-    val_transform = get_val_transform(max_size=args.max_size)
+    # Training configuration optimized for M1
+    config = {
+        'batch_size': 1,
+        'max_size': 640,  # Reduced from 1536 for speed
+        'num_epochs': 10,
+        'lr': 1e-4,
+        'rpn_post_nms_top_n': 300,  # Reduced from 1000 for speed
+    }
     
-    if args.dataset == 'visdrone':
-        train_dataset = VisDroneDataset(args.data_dir, split='train', transform=train_transform)
-        val_dataset = VisDroneDataset(args.data_dir, split='val', transform=val_transform)
-    elif args.dataset == 'aitod':
-        train_dataset = AITODDataset(args.data_dir, split='train', transform=train_transform)
-        val_dataset = AITODDataset(args.data_dir, split='val', transform=val_transform)
-    else:  # hituav
-        train_dataset = HITUAVDataset(args.data_dir, split='train', transform=train_transform, convert_to_rgb=True)
-        val_dataset = HITUAVDataset(args.data_dir, split='val', transform=val_transform, convert_to_rgb=True)
+    print("\n" + "="*70)
+    print(f"STAGE {args.stage} TRAINING")
+    print("="*70)
     
-    # Optimized DataLoader settings for speed
-    # Increase num_workers for faster data loading (Colab typically supports 2-4)
-    num_workers = min(4, os.cpu_count() or 2)  # Use up to 4 workers
+    if args.stage == 1:
+        print("Stage 1: Baseline Faster-RCNN (Backbone + FPN + RPN)")
+        print("  - NO GFEM, NO NDPA, NO ARPM")
+        print("  - Purpose: Stable anchor learning")
+        config['num_epochs'] = 8  # Shorter for baseline
+    elif args.stage == 2:
+        print("Stage 2: Enable GFEM only")
+        print("  - Freeze everything except GFEM")
+        config['num_epochs'] = 6
+        config['lr'] = 5e-5  # Lower LR for fine-tuning
+    else:
+        print("Stage 3: Enable NDPA + ARPM")
+        print("  - Short fine-tuning of attention modules")
+        config['num_epochs'] = 4
+        config['lr'] = 1e-5  # Very low LR
+    
+    print("\nConfiguration:")
+    print(f"  Device: {device}")
+    print(f"  Batch size: {config['batch_size']}")
+    print(f"  Image size: {config['max_size']}")
+    print(f"  Epochs: {config['num_epochs']}")
+    print(f"  Learning rate: {config['lr']}")
+    print(f"  Dataset subset: {args.subset_ratio*100:.0f}%")
+    print(f"  Mixed precision: {use_amp}")
+    print("="*70 + "\n")
+    
+    # Dataset
+    train_transform = get_train_transform(max_size=config['max_size'])
+    val_transform = get_val_transform(max_size=config['max_size'])
+    
+    train_dataset = HITUAVDataset(args.data_dir, split='train', transform=train_transform, convert_to_rgb=True)
+    val_dataset = HITUAVDataset(args.data_dir, split='val', transform=val_transform, convert_to_rgb=True)
+    
+    # Create subset for faster training
+    train_subset = create_subset_dataset(train_dataset, subset_ratio=args.subset_ratio)
+    
+    # MPS: Disable pin_memory and reduce workers (MPS has memory issues)
+    num_workers = 0 if device.type == 'mps' else 2
+    pin_memory = False if device.type == 'mps' else (device.type == 'cuda')
     
     train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True,
-        collate_fn=collate_fn, num_workers=num_workers, pin_memory=True,
-        prefetch_factor=2, persistent_workers=True if num_workers > 0 else False
+        train_subset, batch_size=config['batch_size'], shuffle=True,
+        collate_fn=collate_fn, num_workers=num_workers, pin_memory=pin_memory
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=False,
-        collate_fn=collate_fn, num_workers=num_workers, pin_memory=True,
-        prefetch_factor=2, persistent_workers=True if num_workers > 0 else False
+        val_dataset, batch_size=1, shuffle=False,
+        collate_fn=collate_fn, num_workers=num_workers, pin_memory=pin_memory
     )
     
-    # Model
-    model = SGGFNet(num_classes=args.num_classes, pretrained=True)
+    # Model - Create with reduced RPN proposals
+    model = SGGFNet(
+        num_classes=args.num_classes, 
+        pretrained=True,
+        rpn_post_nms_top_n=config['rpn_post_nms_top_n']
+    )
+    
+    # Stage-specific model configuration
+    if args.stage == 1:
+        # Baseline: Freeze GFEM, NDPA, ARPM (only train Backbone+FPN+RPN+ROIHead)
+        for param in model.gfem.parameters():
+            param.requires_grad = False
+        for param in model.ndpa.parameters():
+            param.requires_grad = False
+        for param in model.arpm.parameters():
+            param.requires_grad = False
+        # Freeze early backbone layers for transfer learning
+        freeze_backbone_early_layers(model)
+        # Train: Backbone (layer3, layer4), FPN, RPN, ROI Head, fusion_conv
+        print("✓ Stage 1: Training Backbone (layer3, layer4) + FPN + RPN + ROI Head")
+        print("  (GFEM, NDPA, ARPM are frozen)")
+        
+    elif args.stage == 2:
+        # Stage 2: Only train GFEM, keep everything else frozen
+        freeze_except(model, ['gfem', 'fusion_conv'])  # fusion_conv needs updating too
+        print("✓ Stage 2: Training only GFEM module + fusion layer")
+        
+    else:  # Stage 3
+        # Stage 3: Train NDPA and ARPM, keep everything else frozen
+        freeze_except(model, ['ndpa', 'arpm'])
+        print("✓ Stage 3: Training only NDPA and ARPM modules")
+    
     model = model.to(device)
     
-    # Optional: Compile model for faster training (PyTorch 2.0+)
-    # Note: torch.compile can cause OOM during compilation, so use with caution
-    if args.compile and hasattr(torch, 'compile'):
-        print('Compiling model with torch.compile for faster training...')
-        print('⚠ Warning: torch.compile may cause OOM. If you get OOM errors, disable with --no_compile')
-        try:
-            # Use 'default' mode instead of 'reduce-overhead' to reduce memory usage during compilation
-            model = torch.compile(model, mode='default')
-            print('✓ Model compiled')
-        except RuntimeError as e:
-            if 'out of memory' in str(e).lower() or 'OOM' in str(e):
-                print('⚠ torch.compile failed due to OOM. Continuing without compilation.')
-                print('   Training will still be fast with AMP enabled.')
-            else:
-                raise
-    
-    # Mixed precision training (AMP) - 1.5-2x speedup with minimal accuracy impact
-    scaler = None
-    use_amp = args.use_amp and device.type == 'cuda'
-    if use_amp:
-        # Use device-specific GradScaler for PyTorch 2.0+, legacy for older versions
-        if USE_NEW_AMP and device.type == 'cuda':
-            scaler = GradScaler(device='cuda')
-        else:
-            scaler = GradScaler()
-        print('✓ Using Automatic Mixed Precision (AMP) for faster training')
-    
-    # Optimizer
-    optimizer = SGD(
-        model.parameters(),
-        lr=args.lr,
-        momentum=args.momentum,
-        weight_decay=args.weight_decay
-    )
-    
-    # Learning rate scheduler - Use CosineAnnealingLR with warmup for better convergence
-    if args.warmup_epochs > 0:
-        # Warmup + Cosine annealing
-        from torch.optim.lr_scheduler import LambdaLR
-        
-        def lr_lambda(epoch):
-            if epoch < args.warmup_epochs:
-                # Linear warmup
-                return (epoch + 1) / args.warmup_epochs
-            else:
-                # Cosine annealing
-                return 0.5 * (1 + math.cos(math.pi * (epoch - args.warmup_epochs) / (args.num_epochs - args.warmup_epochs)))
-        
-        scheduler = LambdaLR(optimizer, lr_lambda)
-        print(f'✓ Using warmup ({args.warmup_epochs} epochs) + cosine annealing scheduler')
-    else:
-        # Fallback to step LR
-        scheduler = lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
-    
-    # Resume from checkpoint (supports both local and Drive paths)
+    # Resume from checkpoint if provided
     start_epoch = 0
-    if args.resume:
-        if os.path.exists(args.resume):
-            print(f'Loading checkpoint from: {args.resume}')
-            checkpoint = torch.load(args.resume, map_location=device)
-            model.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            start_epoch = checkpoint['epoch']
-            print(f'✓ Resumed from epoch {start_epoch}')
-        else:
-            print(f'⚠ Warning: Checkpoint not found at {args.resume}, starting from epoch 0')
-    
-    # Training loop
     best_map = 0.0
     
-    for epoch in range(start_epoch, args.num_epochs):
-        print(f'\nEpoch {epoch+1}/{args.num_epochs}')
-        print('-' * 50)
+    if args.resume:
+        print(f"\nLoading checkpoint: {args.resume}")
+        checkpoint = torch.load(args.resume, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        start_epoch = checkpoint.get('epoch', 0) + 1
+        best_map = checkpoint.get('metrics', {}).get('mAP', 0.0)
+        print(f"  Resumed from epoch {start_epoch}, best mAP: {best_map:.4f}\n")
+    
+    # Optimizer and scheduler
+    optimizer = AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=config['lr'],
+        weight_decay=1e-4
+    )
+    
+    # Mixed precision scaler
+    if use_amp:
+        if device.type == 'cuda':
+            scaler = torch.cuda.amp.GradScaler()
+        elif device.type == 'mps':
+            # MPS: Disable AMP for now (has memory issues)
+            scaler = None
+            use_amp = False
+            print("⚠ MPS: Mixed precision disabled (memory issues)")
+        else:
+            scaler = None
+            use_amp = False
+    else:
+        scaler = None
+    
+    # MPS: Add memory management (if using MPS)
+    if device.type == 'mps':
+        print("⚠ MPS: Using single worker and no pin_memory for stability")
+        print("⚠ WARNING: MPS may still crash on large models. Consider using CPU for stability.")
+        # Sync before starting (helps with MPS initialization)
+        try:
+            torch.mps.synchronize()
+        except Exception as e:
+            print(f"⚠ MPS initialization failed: {e}")
+            print("  Falling back to CPU...")
+            device = torch.device('cpu')
+            use_amp = False
+    
+    # Training loop
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    
+    print(f"\nStarting training for {config['num_epochs']} epochs...\n")
+    
+    for epoch in range(start_epoch, config['num_epochs']):
+        print(f"Epoch [{epoch+1}/{config['num_epochs']}]")
+        print("-" * 70)
         
         # Train
-        train_loss = train_one_epoch(model, train_loader, optimizer, device, epoch+1, scaler, use_amp, 
-                                    max_grad_norm=10.0, grad_accum_steps=args.grad_accum_steps)
-        print(f'Train Loss: {train_loss:.4f}')
+        train_loss = train_one_epoch(model, train_loader, optimizer, device, epoch, scaler, use_amp)
+        print(f"Train Loss: {train_loss:.4f}\n")
         
-        # Validate (less frequently to save time)
-        metrics = None
-        if (epoch + 1) % args.val_freq == 0 or (epoch + 1) == args.num_epochs:
+        # Validate every 2 epochs or at the end
+        if (epoch + 1) % 2 == 0 or (epoch + 1) == config['num_epochs']:
+            print("Validating...")
             metrics = validate(model, val_loader, device, args.num_classes)
-            print(f'Validation - mAP: {metrics["mAP"]:.4f}, AP50: {metrics["AP50"]:.4f}')
-            print(f'Precision: {metrics["precision"]:.4f}, Recall: {metrics["recall"]:.4f}, F1: {metrics["f1"]:.4f}')
-        else:
-            print(f'Skipping validation (validate every {args.val_freq} epochs)')
-        
-        # Update learning rate
-        scheduler.step()
-        
-        # Save checkpoint
-        checkpoint = {
-            'epoch': epoch + 1,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'train_loss': train_loss
-        }
-        
-        # Add metrics if available
-        if metrics is not None:
-            checkpoint['metrics'] = metrics
-        
-        # Save latest
-        torch.save(checkpoint, os.path.join(args.checkpoint_dir, 'latest.pth'))
-        
-        # Save best (only if metrics are available)
-        if metrics is not None and metrics['mAP'] > best_map:
-            best_map = metrics['mAP']
-            torch.save(checkpoint, os.path.join(args.checkpoint_dir, 'best.pth'))
-            print(f'New best mAP: {best_map:.4f}')
+            
+            print(f"Validation Metrics:")
+            print(f"  mAP: {metrics['mAP']:.4f}")
+            print(f"  AP50: {metrics['AP50']:.4f}")
+            print(f"  Precision: {metrics['precision']:.4f}")
+            print(f"  Recall: {metrics['recall']:.4f}")
+            print(f"  F1: {metrics['f1']:.4f}\n")
+            
+            # Save checkpoint
+            checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'train_loss': train_loss,
+                'metrics': metrics,
+                'stage': args.stage
+            }
+            
+            # Save latest
+            latest_path = os.path.join(args.checkpoint_dir, f'stage{args.stage}_latest.pth')
+            torch.save(checkpoint, latest_path)
+            
+            # Save best
+            if metrics['mAP'] > best_map:
+                best_map = metrics['mAP']
+                best_path = os.path.join(args.checkpoint_dir, f'stage{args.stage}_best.pth')
+                torch.save(checkpoint, best_path)
+                print(f"✓ Saved best checkpoint (mAP: {best_map:.4f})\n")
     
-    print('\nTraining completed!')
+    print("="*70)
+    print(f"Stage {args.stage} training completed!")
+    print(f"Best mAP: {best_map:.4f}")
+    print("="*70)
+    
+    if args.stage < 3:
+        next_stage = args.stage + 1
+        best_checkpoint = os.path.join(args.checkpoint_dir, f'stage{args.stage}_best.pth')
+        print(f"\n💡 To continue with Stage {next_stage}, run:")
+        print(f"   python scripts/train.py --stage {next_stage} --resume {best_checkpoint}")
 
 
 if __name__ == '__main__':
     main()
-

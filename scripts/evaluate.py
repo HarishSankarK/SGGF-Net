@@ -88,8 +88,11 @@ def main():
     
     # Calculate metrics
     print('\nCalculating metrics...')
-    mAP = calculate_map(predictions, targets_list, args.num_classes)
-    AP50 = calculate_ap50(predictions, targets_list, args.num_classes)
+    print('  This may take a few minutes for large datasets...')
+    mAP = calculate_map(predictions, targets_list, args.num_classes, verbose=True)
+    print('\n  Calculating AP50...')
+    AP50 = calculate_ap50(predictions, targets_list, args.num_classes, verbose=True)
+    print('\n  Calculating Precision/Recall/F1...')
     precision, recall, f1 = calculate_precision_recall_f1(predictions, targets_list, args.num_classes)
     
     # Print results
