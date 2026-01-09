@@ -317,6 +317,10 @@ class SGGFNet(nn.Module):
         total_bbox_loss = 0
         num_samples = 0
         
+        # Debug: Print anchor count (can be large, making NDPA slow)
+        if self.training and device.type == 'cpu':
+            print(f'    Computing RPN losses... (anchors: {len(anchors)}, this may be slow on CPU)', flush=True)
+        
         for b in range(B):
             target = targets[b]
             gt_boxes = target['boxes'].to(device)  # (M, 4) in [x_center, y_center, w, h]
@@ -326,8 +330,13 @@ class SGGFNet(nn.Module):
                 labels = torch.zeros(len(anchors), dtype=torch.long, device=device)
                 matched_gt = torch.full((len(anchors),), -1, dtype=torch.long, device=device)
             else:
-                # Use NDPA for label assignment
+                # Use NDPA for label assignment (THIS IS SLOW ON CPU - matrix inverse/det operations)
+                if self.training and device.type == 'cpu' and b == 0:
+                    print(f'    Running NDPA... (anchors: {len(anchors)}, GT boxes: {len(gt_boxes)})', flush=True)
+                    print('    ⏳ NDPA uses matrix inverse/determinant - very slow on CPU!', flush=True)
                 labels, matched_gt, _ = self.ndpa(anchors, gt_boxes)
+                if self.training and device.type == 'cpu' and b == 0:
+                    print('    ✓ NDPA completed', flush=True)
             
             # Get positive and negative indices
             pos_mask = labels == 1

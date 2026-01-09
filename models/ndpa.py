@@ -80,6 +80,7 @@ class NDPA(nn.Module):
         mu_diff = mu1.unsqueeze(1) - mu2.unsqueeze(0)  # (N, M, 2)
         
         # Inverse of sigma2: (M, 2, 2) -> (1, M, 2, 2)
+        # THIS IS SLOW ON CPU - torch.inverse() is expensive
         sigma2_inv = torch.inverse(sigma2)  # (M, 2, 2)
         sigma2_inv = sigma2_inv.unsqueeze(0)  # (1, M, 2, 2)
         
@@ -99,7 +100,8 @@ class NDPA(nn.Module):
         ).squeeze(-1).squeeze(-1)  # (N, M)
         
         # Determinant terms
-        det_sigma1 = torch.det(sigma1)  # (N,)
+        # THIS IS SLOW ON CPU - torch.det() is expensive, especially with many anchors
+        det_sigma1 = torch.det(sigma1)  # (N,) - can be 100k+ for large images
         det_sigma2 = torch.det(sigma2)  # (M,)
         
         # Clamp determinants to avoid negative or zero values
