@@ -453,13 +453,37 @@ def main():
         # Save latest (always)
         latest_path = os.path.join(args.checkpoint_dir, f'stage{args.stage}_latest.pth')
         torch.save(checkpoint, latest_path)
-        print(f"✓ Saved latest checkpoint (epoch {epoch+1})\n", flush=True)
+        if os.path.exists(latest_path):
+            print(f"✓ Saved latest checkpoint (epoch {epoch+1}): {latest_path}\n", flush=True)
+        else:
+            print(f"⚠ WARNING: Checkpoint file not found after save: {latest_path}\n", flush=True)
         
         # Save best only if validation ran and we have a new best mAP
         if is_new_best:
             best_path = os.path.join(args.checkpoint_dir, f'stage{args.stage}_best.pth')
             torch.save(checkpoint, best_path)
-            print(f"✓ Saved best checkpoint (mAP: {best_map:.4f})\n", flush=True)
+            if os.path.exists(best_path):
+                print(f"✓ Saved best checkpoint (mAP: {best_map:.4f}): {best_path}\n", flush=True)
+            else:
+                print(f"⚠ WARNING: Best checkpoint file not found after save: {best_path}\n", flush=True)
+    
+    # Ensure best checkpoint exists (use latest if no best was saved)
+    best_checkpoint_path = os.path.join(args.checkpoint_dir, f'stage{args.stage}_best.pth')
+    latest_checkpoint_path = os.path.join(args.checkpoint_dir, f'stage{args.stage}_latest.pth')
+    
+    if not os.path.exists(best_checkpoint_path):
+        if os.path.exists(latest_checkpoint_path):
+            # If no best checkpoint was saved (validation didn't improve), copy latest as best
+            import shutil
+            shutil.copy2(latest_checkpoint_path, best_checkpoint_path)
+            if os.path.exists(best_checkpoint_path):
+                print(f"✓ Created best checkpoint from latest (mAP: {best_map:.4f})", flush=True)
+            else:
+                print(f"⚠ WARNING: Failed to create best checkpoint from latest", flush=True)
+        else:
+            print(f"⚠ WARNING: No checkpoints found! Latest: {latest_checkpoint_path}, Best: {best_checkpoint_path}", flush=True)
+    else:
+        print(f"✓ Best checkpoint exists: {best_checkpoint_path}", flush=True)
     
     print("="*70)
     print(f"Stage {args.stage} training completed!")
