@@ -366,7 +366,8 @@ def main():
     
     if args.resume:
         print(f"\nLoading checkpoint: {args.resume}", flush=True)
-        checkpoint = torch.load(args.resume, map_location=device)
+        # weights_only=False is safe for our own checkpoints
+        checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'])
         start_epoch = checkpoint.get('epoch', 0) + 1
         best_map = checkpoint.get('metrics', {}).get('mAP', 0.0)

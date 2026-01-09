@@ -62,7 +62,8 @@ def main():
     model = SGGFNet(num_classes=args.num_classes, pretrained=False)
     
     # Load checkpoint
-    checkpoint = torch.load(args.checkpoint, map_location=device)
+    # weights_only=False is safe for our own checkpoints (contains numpy arrays)
+    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
     model = model.to(device)
     model.eval()
