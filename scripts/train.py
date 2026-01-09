@@ -104,15 +104,15 @@ def train_one_epoch(model, dataloader, optimizer, device, epoch, scaler=None, us
         if use_amp and scaler is not None:
             scaler.scale(loss).backward()
             # Gradient clipping
-            scaler.unscale_(optimizer)
+                scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
-            optimizer.step()
-        
+                optimizer.step()
+            
         # MPS: Sync and empty cache periodically
         if device.type == 'mps':
             if (batch_idx + 1) % 50 == 0:
@@ -206,7 +206,7 @@ def main():
         use_amp = True
         print('✓ Using CUDA GPU')
     else:
-        device = torch.device('cpu')
+            device = torch.device('cpu')
         use_amp = False
         if torch.backends.mps.is_available():
             print('✓ Using CPU (MPS available but disabled due to memory crashes)')
@@ -224,9 +224,9 @@ def main():
         'rpn_post_nms_top_n': 300,  # Reduced from 1000 for speed
     }
     
-    print("\n" + "="*70)
-    print(f"STAGE {args.stage} TRAINING")
-    print("="*70)
+    print("\n" + "="*70, flush=True)
+    print(f"STAGE {args.stage} TRAINING", flush=True)
+    print("="*70, flush=True)
     
     if args.stage == 1:
         print("Stage 1: Baseline Faster-RCNN (Backbone + FPN + RPN)")
@@ -244,15 +244,15 @@ def main():
         config['num_epochs'] = 4
         config['lr'] = 1e-5  # Very low LR
     
-    print("\nConfiguration:")
-    print(f"  Device: {device}")
-    print(f"  Batch size: {config['batch_size']}")
-    print(f"  Image size: {config['max_size']}")
-    print(f"  Epochs: {config['num_epochs']}")
-    print(f"  Learning rate: {config['lr']}")
-    print(f"  Dataset subset: {args.subset_ratio*100:.0f}%")
-    print(f"  Mixed precision: {use_amp}")
-    print("="*70 + "\n")
+    print("\nConfiguration:", flush=True)
+    print(f"  Device: {device}", flush=True)
+    print(f"  Batch size: {config['batch_size']}", flush=True)
+    print(f"  Image size: {config['max_size']}", flush=True)
+    print(f"  Epochs: {config['num_epochs']}", flush=True)
+    print(f"  Learning rate: {config['lr']}", flush=True)
+    print(f"  Dataset subset: {args.subset_ratio*100:.0f}%", flush=True)
+    print(f"  Mixed precision: {use_amp}", flush=True)
+    print("="*70 + "\n", flush=True)
     
     # Dataset - Check if it exists first
     if not os.path.exists(args.data_dir):
@@ -271,10 +271,10 @@ def main():
         train_transform = get_train_transform(max_size=config['max_size'])
         val_transform = get_val_transform(max_size=config['max_size'])
         
-        print(f"\nLoading dataset from: {args.data_dir}")
+        print(f"\nLoading dataset from: {args.data_dir}", flush=True)
         train_dataset = HITUAVDataset(args.data_dir, split='train', transform=train_transform, convert_to_rgb=True)
         val_dataset = HITUAVDataset(args.data_dir, split='val', transform=val_transform, convert_to_rgb=True)
-        print(f"✓ Dataset loaded: {len(train_dataset)} train, {len(val_dataset)} val samples")
+        print(f"✓ Dataset loaded: {len(train_dataset)} train, {len(val_dataset)} val samples", flush=True)
     except Exception as e:
         print(f"\n❌ ERROR loading dataset: {e}")
         print(f"\nPlease check:")
@@ -301,11 +301,13 @@ def main():
     )
     
     # Model - Create with reduced RPN proposals
+    print("Creating model...", flush=True)
     model = SGGFNet(
         num_classes=args.num_classes, 
         pretrained=True,
         rpn_post_nms_top_n=config['rpn_post_nms_top_n']
     )
+    print("✓ Model created", flush=True)
     
     # Stage-specific model configuration
     if args.stage == 1:
@@ -319,32 +321,34 @@ def main():
         # Freeze early backbone layers for transfer learning
         freeze_backbone_early_layers(model)
         # Train: Backbone (layer3, layer4), FPN, RPN, ROI Head, fusion_conv
-        print("✓ Stage 1: Training Backbone (layer3, layer4) + FPN + RPN + ROI Head")
-        print("  (GFEM, NDPA, ARPM are frozen)")
+        print("✓ Stage 1: Training Backbone (layer3, layer4) + FPN + RPN + ROI Head", flush=True)
+        print("  (GFEM, NDPA, ARPM are frozen)", flush=True)
         
     elif args.stage == 2:
         # Stage 2: Only train GFEM, keep everything else frozen
         freeze_except(model, ['gfem', 'fusion_conv'])  # fusion_conv needs updating too
-        print("✓ Stage 2: Training only GFEM module + fusion layer")
+        print("✓ Stage 2: Training only GFEM module + fusion layer", flush=True)
         
     else:  # Stage 3
         # Stage 3: Train NDPA and ARPM, keep everything else frozen
         freeze_except(model, ['ndpa', 'arpm'])
-        print("✓ Stage 3: Training only NDPA and ARPM modules")
+        print("✓ Stage 3: Training only NDPA and ARPM modules", flush=True)
     
+    print(f"Moving model to device: {device}...", flush=True)
     model = model.to(device)
+    print("✓ Model moved to device", flush=True)
     
     # Resume from checkpoint if provided
     start_epoch = 0
     best_map = 0.0
     
     if args.resume:
-        print(f"\nLoading checkpoint: {args.resume}")
+        print(f"\nLoading checkpoint: {args.resume}", flush=True)
         checkpoint = torch.load(args.resume, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
         start_epoch = checkpoint.get('epoch', 0) + 1
         best_map = checkpoint.get('metrics', {}).get('mAP', 0.0)
-        print(f"  Resumed from epoch {start_epoch}, best mAP: {best_map:.4f}\n")
+        print(f"  Resumed from epoch {start_epoch}, best mAP: {best_map:.4f}\n", flush=True)
     
     # Optimizer and scheduler
     optimizer = AdamW(
@@ -384,11 +388,11 @@ def main():
     # Training loop
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     
-    print(f"\nStarting training for {config['num_epochs']} epochs...\n")
+    print(f"\nStarting training for {config['num_epochs']} epochs...\n", flush=True)
     
     for epoch in range(start_epoch, config['num_epochs']):
-        print(f"Epoch [{epoch+1}/{config['num_epochs']}]")
-        print("-" * 70)
+        print(f"Epoch [{epoch+1}/{config['num_epochs']}]", flush=True)
+        print("-" * 70, flush=True)
         
         # Train
         train_loss = train_one_epoch(model, train_loader, optimizer, device, epoch, scaler, use_amp)
@@ -405,24 +409,24 @@ def main():
             print(f"  Precision: {metrics['precision']:.4f}")
             print(f"  Recall: {metrics['recall']:.4f}")
             print(f"  F1: {metrics['f1']:.4f}\n")
-            
-            # Save checkpoint
-            checkpoint = {
+        
+        # Save checkpoint
+        checkpoint = {
                 'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
                 'train_loss': train_loss,
                 'metrics': metrics,
                 'stage': args.stage
-            }
-            
-            # Save latest
+        }
+        
+        # Save latest
             latest_path = os.path.join(args.checkpoint_dir, f'stage{args.stage}_latest.pth')
             torch.save(checkpoint, latest_path)
-            
+        
             # Save best
             if metrics['mAP'] > best_map:
-                best_map = metrics['mAP']
+            best_map = metrics['mAP']
                 best_path = os.path.join(args.checkpoint_dir, f'stage{args.stage}_best.pth')
                 torch.save(checkpoint, best_path)
                 print(f"✓ Saved best checkpoint (mAP: {best_map:.4f})\n")
