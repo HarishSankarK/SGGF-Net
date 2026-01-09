@@ -254,12 +254,35 @@ def main():
     print(f"  Mixed precision: {use_amp}")
     print("="*70 + "\n")
     
-    # Dataset
-    train_transform = get_train_transform(max_size=config['max_size'])
-    val_transform = get_val_transform(max_size=config['max_size'])
+    # Dataset - Check if it exists first
+    if not os.path.exists(args.data_dir):
+        print(f"\n❌ ERROR: Dataset directory not found: {args.data_dir}")
+        print("\nPlease ensure the HIT-UAV dataset is available:")
+        print("  1. Download from: https://github.com/Syo9/HIT-UAV")
+        print("  2. Extract to: data/hit-uav/")
+        print("  3. Expected structure:")
+        print("     data/hit-uav/")
+        print("       ├── images/")
+        print("       └── annotations/")
+        sys.exit(1)
     
-    train_dataset = HITUAVDataset(args.data_dir, split='train', transform=train_transform, convert_to_rgb=True)
-    val_dataset = HITUAVDataset(args.data_dir, split='val', transform=val_transform, convert_to_rgb=True)
+    # Dataset
+    try:
+        train_transform = get_train_transform(max_size=config['max_size'])
+        val_transform = get_val_transform(max_size=config['max_size'])
+        
+        print(f"\nLoading dataset from: {args.data_dir}")
+        train_dataset = HITUAVDataset(args.data_dir, split='train', transform=train_transform, convert_to_rgb=True)
+        val_dataset = HITUAVDataset(args.data_dir, split='val', transform=val_transform, convert_to_rgb=True)
+        print(f"✓ Dataset loaded: {len(train_dataset)} train, {len(val_dataset)} val samples")
+    except Exception as e:
+        print(f"\n❌ ERROR loading dataset: {e}")
+        print(f"\nPlease check:")
+        print(f"  1. Dataset directory exists: {args.data_dir}")
+        print(f"  2. Dataset structure is correct (images/ and annotations/ folders)")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
     
     # Create subset for faster training
     train_subset = create_subset_dataset(train_dataset, subset_ratio=args.subset_ratio)
