@@ -104,14 +104,14 @@ def train_one_epoch(model, dataloader, optimizer, device, epoch, scaler=None, us
         if use_amp and scaler is not None:
             scaler.scale(loss).backward()
             # Gradient clipping
-                scaler.unscale_(optimizer)
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
-                optimizer.step()
+            optimizer.step()
             
         # MPS: Sync and empty cache periodically
         if device.type == 'mps':
@@ -206,7 +206,7 @@ def main():
         use_amp = True
         print('✓ Using CUDA GPU')
     else:
-            device = torch.device('cpu')
+        device = torch.device('cpu')
         use_amp = False
         if torch.backends.mps.is_available():
             print('✓ Using CPU (MPS available but disabled due to memory crashes)')
@@ -344,8 +344,8 @@ def main():
     
     if args.resume:
         print(f"\nLoading checkpoint: {args.resume}", flush=True)
-            checkpoint = torch.load(args.resume, map_location=device)
-            model.load_state_dict(checkpoint['model_state_dict'])
+        checkpoint = torch.load(args.resume, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
         start_epoch = checkpoint.get('epoch', 0) + 1
         best_map = checkpoint.get('metrics', {}).get('mAP', 0.0)
         print(f"  Resumed from epoch {start_epoch}, best mAP: {best_map:.4f}\n", flush=True)
