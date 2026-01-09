@@ -104,14 +104,14 @@ def train_one_epoch(model, dataloader, optimizer, device, epoch, scaler=None, us
         if use_amp and scaler is not None:
             scaler.scale(loss).backward()
             # Gradient clipping
-            scaler.unscale_(optimizer)
+                scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
-            optimizer.step()
+                optimizer.step()
             
         # MPS: Sync and empty cache periodically
         if device.type == 'mps':
@@ -206,7 +206,7 @@ def main():
         use_amp = True
         print('✓ Using CUDA GPU')
     else:
-        device = torch.device('cpu')
+            device = torch.device('cpu')
         use_amp = False
         if torch.backends.mps.is_available():
             print('✓ Using CPU (MPS available but disabled due to memory crashes)')
@@ -344,8 +344,8 @@ def main():
     
     if args.resume:
         print(f"\nLoading checkpoint: {args.resume}", flush=True)
-        checkpoint = torch.load(args.resume, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
+            checkpoint = torch.load(args.resume, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
         start_epoch = checkpoint.get('epoch', 0) + 1
         best_map = checkpoint.get('metrics', {}).get('mAP', 0.0)
         print(f"  Resumed from epoch {start_epoch}, best mAP: {best_map:.4f}\n", flush=True)
@@ -360,7 +360,7 @@ def main():
     # Mixed precision scaler
     if use_amp:
         if device.type == 'cuda':
-            scaler = torch.cuda.amp.GradScaler()
+            scaler = torch.amp.GradScaler('cuda')
         elif device.type == 'mps':
             # MPS: Disable AMP for now (has memory issues)
             scaler = None
@@ -399,34 +399,41 @@ def main():
         print(f"Train Loss: {train_loss:.4f}\n")
         
         # Validate every 2 epochs or at the end
+        metrics = None
+        is_new_best = False
         if (epoch + 1) % 2 == 0 or (epoch + 1) == config['num_epochs']:
-            print("Validating...")
+            print("Validating...", flush=True)
             metrics = validate(model, val_loader, device, args.num_classes)
             
-            print(f"Validation Metrics:")
-            print(f"  mAP: {metrics['mAP']:.4f}")
-            print(f"  AP50: {metrics['AP50']:.4f}")
-            print(f"  Precision: {metrics['precision']:.4f}")
-            print(f"  Recall: {metrics['recall']:.4f}")
-            print(f"  F1: {metrics['f1']:.4f}\n")
+            print(f"Validation Metrics:", flush=True)
+            print(f"  mAP: {metrics['mAP']:.4f}", flush=True)
+            print(f"  AP50: {metrics['AP50']:.4f}", flush=True)
+            print(f"  Precision: {metrics['precision']:.4f}", flush=True)
+            print(f"  Recall: {metrics['recall']:.4f}", flush=True)
+            print(f"  F1: {metrics['f1']:.4f}\n", flush=True)
+            
+            # Update best mAP if validation ran
+            if metrics['mAP'] > best_map:
+                best_map = metrics['mAP']
+                is_new_best = True
         
-        # Save checkpoint
+        # Save checkpoint (always save latest, best only if metrics exist)
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'train_loss': train_loss,
-            'metrics': metrics,
+            'metrics': metrics if metrics is not None else {},
             'stage': args.stage
         }
         
-        # Save latest
+        # Save latest (always)
         latest_path = os.path.join(args.checkpoint_dir, f'stage{args.stage}_latest.pth')
         torch.save(checkpoint, latest_path)
+        print(f"✓ Saved latest checkpoint (epoch {epoch+1})\n", flush=True)
         
-        # Save best
-        if metrics['mAP'] > best_map:
-            best_map = metrics['mAP']
+        # Save best only if validation ran and we have a new best mAP
+        if is_new_best:
             best_path = os.path.join(args.checkpoint_dir, f'stage{args.stage}_best.pth')
             torch.save(checkpoint, best_path)
             print(f"✓ Saved best checkpoint (mAP: {best_map:.4f})\n", flush=True)
