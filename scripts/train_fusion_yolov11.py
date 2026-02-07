@@ -1,0 +1,542 @@
+"""
+Training Script for Fusion-YOLOv11
+Dual-stream RGB-Thermal multimodal object detection
+"""
+
+import os
+import sys
+import argparse
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, ConcatDataset
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+import numpy as np
+from tqdm import tqdm
+
+# Add parent directory to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+from models import FusionYOLOv11
+from utils.dataset import DroneRGBTDataset, HITUAVDataset, SMODDataset
+from utils.transforms import get_train_transform, get_val_transform
+from utils.metrics import calculate_map, calculate_ap50
+
+
+def collate_fn_paired(batch):
+    """Custom collate function for paired RGB-Thermal data"""
+    rgb_images = [item[0][0] for item in batch]
+    thermal_images = [item[0][1] for item in batch]
+    targets = [item[1] for item in batch]
+    return rgb_images, thermal_images, targets
+
+
+def collate_fn_single(batch):
+    """Custom collate function for single modality data"""
+    images = [item[0] for item in batch]
+    targets = [item[1] for item in batch]
+    return images, targets
+
+
+def collate_fn_combined(batch):
+    """
+    Custom collate function for combined dataset (DroneRGBT + SMOD)
+    Handles both paired (RGB-Thermal) and single (RGB) data formats
+    """
+    rgb_images = []
+    thermal_images = []
+    targets = []
+    
+    for item in batch:
+        # Check if it's paired data (DroneRGBT) or single data (SMOD)
+        if isinstance(item[0], tuple):
+            # Paired RGB-Thermal data from DroneRGBT
+            rgb_img, thermal_img = item[0]
+            rgb_images.append(rgb_img)
+            thermal_images.append(thermal_img)
+        else:
+            # Single RGB data from SMOD - duplicate for thermal
+            rgb_img = item[0]
+            rgb_images.append(rgb_img)
+            thermal_images.append(rgb_img)  # Use same image for thermal
+        
+        targets.append(item[1])
+    
+    return rgb_images, thermal_images, targets
+
+
+def train_one_epoch(model, dataloader, optimizer, device, epoch, scaler=None, use_amp=False):
+    """Train for one epoch"""
+    model.train()
+    total_loss = 0.0
+    num_batches = 0
+    
+    progress_bar = tqdm(dataloader, desc=f'Epoch {epoch+1} [Train]')
+    
+    for batch_idx, batch_data in enumerate(progress_bar):
+        # Handle different dataset types
+        # Paired data returns (rgb_images, thermal_images, targets) - 3 elements
+        # Single modality returns (images, targets) - 2 elements
+        if len(batch_data) == 3:
+            # Paired RGB-Thermal (DroneRGBT)
+            rgb_images, thermal_images, targets = batch_data
+            rgb_images = [img.to(device) for img in rgb_images]
+            thermal_images = [img.to(device) for img in thermal_images]
+            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+            
+            optimizer.zero_grad()
+            
+            if use_amp and device.type == 'cuda':
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    loss_dict = model(rgb_images, thermal_images, targets)
+                    loss = sum(loss for loss in loss_dict.values())
+            else:
+                loss_dict = model(rgb_images, thermal_images, targets)
+                loss = sum(loss for loss in loss_dict.values())
+        else:
+            # Single modality - create dummy thermal images for now
+            images, targets = batch_data
+            images = [img.to(device) for img in images]
+            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+            
+            # For single modality, use same image for both RGB and Thermal
+            # (This allows training on HIT-UAV or SMOD alone)
+            thermal_images = images
+            
+            optimizer.zero_grad()
+            
+            if use_amp and device.type == 'cuda':
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    loss_dict = model(images, thermal_images, targets)
+                    loss = sum(loss for loss in loss_dict.values())
+            else:
+                loss_dict = model(images, thermal_images, targets)
+                loss = sum(loss for loss in loss_dict.values())
+        
+        if use_amp and device.type == 'cuda':
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
+        
+        total_loss += loss.item()
+        num_batches += 1
+        
+        # Update progress bar
+        progress_bar.set_postfix({
+            'loss': f'{loss.item():.4f}',
+            'avg_loss': f'{total_loss/num_batches:.4f}'
+        })
+    
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    return avg_loss
+
+
+def freeze_backbone_layers(model, freeze_early=True, freeze_layers=['layer0', 'layer1', 'layer2']):
+    """
+    Freeze ResNet backbone layers for transfer learning
+    
+    Args:
+        model: FusionYOLOv11 model
+        freeze_early: If True, freeze early layers (layer0, layer1, layer2)
+        freeze_layers: List of layer names to freeze
+    """
+    frozen_count = 0
+    total_count = 0
+    
+    # Freeze RGB backbone layers
+    for name, param in model.dual_stream.rgb_backbone.named_parameters():
+        total_count += 1
+        if freeze_early:
+            # Freeze layer0, layer1, layer2 (early feature extraction)
+            if any(layer in name for layer in freeze_layers):
+                param.requires_grad = False
+                frozen_count += 1
+            else:
+                param.requires_grad = True
+        else:
+            param.requires_grad = True
+    
+    # Freeze Thermal backbone layers (same structure)
+    for name, param in model.dual_stream.thermal_backbone.named_parameters():
+        if freeze_early:
+            if any(layer in name for layer in freeze_layers):
+                param.requires_grad = False
+            else:
+                param.requires_grad = True
+    
+    if freeze_early:
+        print(f'✓ Transfer Learning: Frozen {frozen_count}/{total_count} early backbone layers')
+        print(f'  Frozen: {", ".join(freeze_layers)}')
+        print(f'  Training: layer3, layer4, GFEM, Fusion, PANet, Detection Head')
+    else:
+        print('✓ Training all layers (no freezing)')
+    
+    return frozen_count
+
+
+def unfreeze_all_layers(model):
+    """Unfreeze all model parameters"""
+    for param in model.parameters():
+        param.requires_grad = True
+    print('✓ Unfrozen all layers')
+
+
+def validate(model, dataloader, device, epoch, num_classes):
+    """Validate model"""
+    model.eval()
+    all_predictions = []
+    all_targets = []
+    
+    progress_bar = tqdm(dataloader, desc=f'Epoch {epoch+1} [Val]')
+    
+    with torch.no_grad():
+        for batch_data in progress_bar:
+            if len(batch_data) == 3:
+                # Paired RGB-Thermal
+                rgb_images, thermal_images, targets = batch_data
+                rgb_images = [img.to(device) for img in rgb_images]
+                thermal_images = [img.to(device) for img in thermal_images]
+                
+                # Get predictions with post-processing
+                predictions = model.predict(rgb_images, thermal_images, 
+                                           conf_threshold=0.5, nms_threshold=0.5)
+            else:
+                # Single modality
+                images, targets = batch_data
+                images = [img.to(device) for img in images]
+                thermal_images = images
+                
+                # Get predictions with post-processing
+                predictions = model.predict(images, thermal_images,
+                                           conf_threshold=0.5, nms_threshold=0.5)
+            
+            # Store predictions and targets
+            all_predictions.extend(predictions)
+            all_targets.extend(targets)
+    
+    # Compute metrics
+    from utils.metrics import calculate_map, calculate_ap50
+    
+    # Convert targets to standard format
+    formatted_targets = []
+    for target in all_targets:
+        formatted_targets.append({
+            'boxes': target['boxes'].cpu().numpy(),
+            'labels': target['labels'].cpu().numpy()
+        })
+    
+    # Convert predictions to standard format
+    formatted_predictions = []
+    for pred in all_predictions:
+        formatted_predictions.append({
+            'boxes': pred['boxes'].cpu().numpy(),
+            'scores': pred['scores'].cpu().numpy(),
+            'labels': pred['labels'].cpu().numpy()
+        })
+    
+    # Compute mAP (requires num_classes parameter)
+    map_score = calculate_map(formatted_predictions, formatted_targets, num_classes)
+    ap50_score = calculate_ap50(formatted_predictions, formatted_targets, num_classes)
+    
+    return map_score, ap50_score
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Train Fusion-YOLOv11')
+    parser.add_argument('--dataset', type=str, default='dronergbt',
+                       choices=['dronergbt', 'hituav', 'smod', 'combined'],
+                       help='Dataset to use')
+    parser.add_argument('--data_dir', type=str, 
+                       default='sggf_net/data/dronergbt',
+                       help='Dataset root directory (for single dataset)')
+    parser.add_argument('--dronergbt_dir', type=str,
+                       default='sggf_net/data/DroneRGBT',
+                       help='DroneRGBT dataset directory (for combined training)')
+    parser.add_argument('--smod_dir', type=str,
+                       default='sggf_net/data/SMOD',
+                       help='SMOD dataset directory (for combined training)')
+    parser.add_argument('--num_classes', type=int, default=2,
+                       help='Number of classes (DroneRGBT: 2=background+person, SMOD: 3=background+person+vehicle, HIT-UAV: 6)')
+    parser.add_argument('--checkpoint_dir', type=str, default='sggf_net/checkpoints',
+                       help='Checkpoint directory')
+    parser.add_argument('--batch_size', type=int, default=4,
+                       help='Batch size')
+    parser.add_argument('--epochs', type=int, default=100,
+                       help='Number of epochs')
+    parser.add_argument('--lr', type=float, default=1e-3,
+                       help='Learning rate')
+    parser.add_argument('--resume', type=str, default=None,
+                       help='Resume from checkpoint (path to .pth file, or "latest" or "best" to auto-detect)')
+    parser.add_argument('--auto_resume', action='store_true',
+                       help='Automatically resume from latest.pth if it exists')
+    parser.add_argument('--use_amp', action='store_true',
+                       help='Use mixed precision training')
+    parser.add_argument('--freeze_backbone', action='store_true',
+                       help='Freeze early ResNet layers (layer0, layer1, layer2) for faster training')
+    parser.add_argument('--freeze_epochs', type=int, default=None,
+                       help='Number of epochs to train with frozen backbone, then unfreeze (progressive unfreezing)')
+    
+    args = parser.parse_args()
+    
+    # Device setup
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f'Using device: {device}')
+    
+    # Create checkpoint directory
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    
+    # Load dataset
+    train_transform = get_train_transform()
+    val_transform = get_val_transform()
+    
+    # Set num_classes based on dataset if not explicitly provided
+    if args.num_classes == 2:  # Default value
+        if args.dataset == 'smod':
+            args.num_classes = 3  # SMOD: background + person + vehicle
+        elif args.dataset == 'dronergbt':
+            args.num_classes = 2  # DroneRGBT: background + person
+        elif args.dataset == 'combined':
+            args.num_classes = 3  # Combined: background + person + vehicle
+        elif args.dataset == 'hituav':
+            args.num_classes = 6  # HIT-UAV: 6 classes
+    
+    if args.dataset == 'dronergbt':
+        train_dataset = DroneRGBTDataset(
+            root_dir=args.data_dir, split='train', transform=train_transform
+        )
+        val_dataset = DroneRGBTDataset(
+            root_dir=args.data_dir, split='val', transform=val_transform
+        )
+        collate_fn = collate_fn_paired
+    elif args.dataset == 'hituav':
+        train_dataset = HITUAVDataset(
+            root_dir=args.data_dir, split='train', transform=train_transform
+        )
+        val_dataset = HITUAVDataset(
+            root_dir=args.data_dir, split='val', transform=val_transform
+        )
+        collate_fn = collate_fn_single
+    elif args.dataset == 'smod':
+        train_dataset = SMODDataset(
+            root_dir=args.data_dir, split='train', transform=train_transform
+        )
+        val_dataset = SMODDataset(
+            root_dir=args.data_dir, split='val', transform=val_transform
+        )
+        collate_fn = collate_fn_single
+    elif args.dataset == 'combined':
+        # Combined dataset: DroneRGBT + SMOD
+        print("Loading combined dataset (DroneRGBT + SMOD)...")
+        
+        # Check if directories exist
+        if not os.path.exists(args.dronergbt_dir):
+            raise ValueError(f"DroneRGBT directory not found: {args.dronergbt_dir}\n"
+                           f"Please ensure DroneRGBT dataset is preprocessed and exists at this path.")
+        
+        if not os.path.exists(args.smod_dir):
+            raise ValueError(f"SMOD directory not found: {args.smod_dir}\n"
+                           f"Please ensure SMOD dataset exists at this path.\n"
+                           f"Expected structure:\n"
+                           f"  {args.smod_dir}/\n"
+                           f"    ├── images/\n"
+                           f"    │   ├── train/\n"
+                           f"    │   ├── val/\n"
+                           f"    │   └── test/\n"
+                           f"    └── labels/\n"
+                           f"        ├── train/\n"
+                           f"        ├── val/\n"
+                           f"        └── test/\n"
+                           f"\nIf you only want to train on DroneRGBT, use:\n"
+                           f"  --dataset dronergbt --data_dir {args.dronergbt_dir}")
+        
+        # Load DroneRGBT dataset
+        try:
+            dronergbt_train = DroneRGBTDataset(
+                root_dir=args.dronergbt_dir, split='train', transform=train_transform
+            )
+            dronergbt_val = DroneRGBTDataset(
+                root_dir=args.dronergbt_dir, split='val', transform=val_transform
+            )
+        except Exception as e:
+            raise ValueError(f"Failed to load DroneRGBT dataset: {e}\n"
+                           f"Please ensure DroneRGBT dataset is preprocessed correctly.")
+        
+        # Load SMOD dataset
+        try:
+            smod_train = SMODDataset(
+                root_dir=args.smod_dir, split='train', transform=train_transform
+            )
+            smod_val = SMODDataset(
+                root_dir=args.smod_dir, split='val', transform=val_transform
+            )
+        except Exception as e:
+            raise ValueError(f"Failed to load SMOD dataset: {e}\n"
+                           f"Please ensure SMOD dataset structure is correct.\n"
+                           f"Expected: {args.smod_dir}/images/train/ and {args.smod_dir}/labels/train/")
+        
+        # Concatenate datasets
+        train_dataset = ConcatDataset([dronergbt_train, smod_train])
+        val_dataset = ConcatDataset([dronergbt_val, smod_val])
+        
+        collate_fn = collate_fn_combined
+        
+        print(f"✓ Combined dataset loaded:")
+        print(f"  Train: {len(dronergbt_train)} DroneRGBT + {len(smod_train)} SMOD = {len(train_dataset)} total")
+        print(f"  Val: {len(dronergbt_val)} DroneRGBT + {len(smod_val)} SMOD = {len(val_dataset)} total")
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset}")
+    
+    # Disable pin_memory on MPS (not supported)
+    pin_memory = device.type == 'cuda'
+    
+    train_loader = DataLoader(
+        train_dataset, batch_size=args.batch_size, shuffle=True,
+        collate_fn=collate_fn, num_workers=2, pin_memory=pin_memory
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=args.batch_size, shuffle=False,
+        collate_fn=collate_fn, num_workers=2, pin_memory=pin_memory
+    )
+    
+    # Create model
+    model = FusionYOLOv11(
+        num_classes=args.num_classes,
+        pretrained=True,
+        fusion_type='concat_attention'
+    )
+    model = model.to(device)
+    
+    # Transfer Learning: Freeze early backbone layers BEFORE creating optimizer
+    # This ensures optimizer only includes trainable parameters
+    if args.freeze_backbone:
+        freeze_backbone_layers(model, freeze_early=True)
+    else:
+        print('✓ Training all layers (no freezing)')
+    
+    # Optimizer: Only include trainable parameters (important for frozen layers)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=5e-4)
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+    
+    # Mixed precision scaler
+    scaler = torch.cuda.amp.GradScaler() if args.use_amp and device.type == 'cuda' else None
+    
+    # Resume from checkpoint
+    start_epoch = 0
+    best_map = 0.0
+    
+    # Auto-resume logic: if --auto_resume is set and latest.pth exists, use it
+    if args.auto_resume and args.resume is None:
+        latest_checkpoint = os.path.join(args.checkpoint_dir, 'latest.pth')
+        if os.path.exists(latest_checkpoint):
+            args.resume = latest_checkpoint
+            print(f'Auto-resuming from: {latest_checkpoint}')
+    
+    # Handle resume shortcuts: "latest" or "best"
+    if args.resume:
+        if args.resume.lower() == 'latest':
+            args.resume = os.path.join(args.checkpoint_dir, 'latest.pth')
+        elif args.resume.lower() == 'best':
+            args.resume = os.path.join(args.checkpoint_dir, 'best.pth')
+    
+    if args.resume:
+        if not os.path.exists(args.resume):
+            print(f'Warning: Checkpoint not found: {args.resume}')
+            print('Starting training from scratch...')
+        else:
+            print(f'Loading checkpoint: {args.resume}')
+            checkpoint = torch.load(args.resume, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            
+            # Note: When resuming with frozen layers, optimizer state may not match
+            # We'll try to load it, but recreate if needed
+            try:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            except:
+                print('  Warning: Optimizer state mismatch (possibly due to freezing). Recreating optimizer...')
+                trainable_params = [p for p in model.parameters() if p.requires_grad]
+                optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=5e-4)
+            
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            start_epoch = checkpoint['epoch']
+            best_map = checkpoint.get('best_map', 0.0)
+            
+            # Load scaler state if it exists and we're using AMP
+            if scaler is not None and 'scaler_state_dict' in checkpoint:
+                scaler.load_state_dict(checkpoint['scaler_state_dict'])
+                print(f'  Loaded scaler state')
+            
+            print(f'  Resumed from epoch {start_epoch}')
+            print(f'  Best mAP so far: {best_map:.4f}')
+            print(f'  Continuing training from epoch {start_epoch} to {args.epochs}')
+    
+    # Training loop
+    print(f'Starting training for {args.epochs} epochs...')
+    if args.freeze_backbone and args.freeze_epochs:
+        print(f'  Transfer Learning: Training with frozen backbone for {args.freeze_epochs} epochs')
+        print(f'  Then unfreezing for remaining {args.epochs - args.freeze_epochs} epochs')
+    
+    for epoch in range(start_epoch, args.epochs):
+        # Progressive unfreezing: unfreeze after freeze_epochs
+        if args.freeze_backbone and args.freeze_epochs and epoch == args.freeze_epochs:
+            print(f'\n🔄 Epoch {epoch+1}: Unfreezing all layers for fine-tuning...')
+            unfreeze_all_layers(model)
+            # Recreate optimizer with all parameters now that we've unfrozen
+            optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=5e-4)
+            # Adjust scheduler T_max for remaining epochs
+            remaining_epochs = args.epochs - args.freeze_epochs
+            scheduler = CosineAnnealingLR(optimizer, T_max=remaining_epochs)
+            print(f'  Recreated optimizer with all parameters')
+            print(f'  Adjusted scheduler for {remaining_epochs} remaining epochs')
+        # Train
+        train_loss = train_one_epoch(
+            model, train_loader, optimizer, device, epoch, scaler, args.use_amp
+        )
+        
+        # Validate
+        val_map, val_ap50 = validate(model, val_loader, device, epoch, args.num_classes)
+        
+        # Update learning rate
+        scheduler.step()
+        
+        print(f'Epoch {epoch+1}/{args.epochs}:')
+        print(f'  Train Loss: {train_loss:.4f}')
+        print(f'  Val mAP: {val_map:.4f}, Val AP50: {val_ap50:.4f}')
+        
+        # Save checkpoint
+        checkpoint = {
+            'epoch': epoch + 1,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'best_map': best_map,
+            'val_map': val_map,
+            'val_ap50': val_ap50,
+            'args': vars(args)  # Save training arguments for reference
+        }
+        
+        # Save scaler state if using AMP
+        if scaler is not None:
+            checkpoint['scaler_state_dict'] = scaler.state_dict()
+        
+        # Save latest checkpoint (always)
+        latest_path = os.path.join(args.checkpoint_dir, 'latest.pth')
+        torch.save(checkpoint, latest_path)
+        print(f'  ✓ Saved latest checkpoint: {latest_path}')
+        
+        # Save best checkpoint (only when mAP improves)
+        if val_map > best_map:
+            best_map = val_map
+            checkpoint['best_map'] = best_map
+            best_path = os.path.join(args.checkpoint_dir, 'best.pth')
+            torch.save(checkpoint, best_path)
+            print(f'  ✓ Saved best model (mAP: {best_map:.4f}): {best_path}')
+    
+    print(f'Training completed! Best mAP: {best_map:.4f}')
+
+
+if __name__ == '__main__':
+    main()

@@ -1,6 +1,6 @@
 torch>=1.12.0
 torchvision>=0.13.0
-torch_xla[tpu]>=2.0.0
+# torch_xla[tpu]>=2.0.0  # Only needed for Google Cloud TPU training, not available on macOS
 numpy>=1.21.0
 Pillow>=9.0.0
 opencv-python>=4.5.0
