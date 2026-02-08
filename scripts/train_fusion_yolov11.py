@@ -71,7 +71,8 @@ def train_one_epoch(model, dataloader, optimizer, device, epoch, scaler=None, us
     total_loss = 0.0
     num_batches = 0
     
-    progress_bar = tqdm(dataloader, desc=f'Epoch {epoch+1} [Train]')
+    # Reduce progress bar update frequency for better performance
+    progress_bar = tqdm(dataloader, desc=f'Epoch {epoch+1} [Train]', mininterval=1.0)
     
     for batch_idx, batch_data in enumerate(progress_bar):
         # Handle different dataset types
@@ -80,9 +81,10 @@ def train_one_epoch(model, dataloader, optimizer, device, epoch, scaler=None, us
         if len(batch_data) == 3:
             # Paired RGB-Thermal (DroneRGBT)
             rgb_images, thermal_images, targets = batch_data
-            rgb_images = [img.to(device) for img in rgb_images]
-            thermal_images = [img.to(device) for img in thermal_images]
-            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+            # Use non_blocking transfer for faster GPU transfer (overlaps with computation)
+            rgb_images = [img.to(device, non_blocking=True) for img in rgb_images]
+            thermal_images = [img.to(device, non_blocking=True) for img in thermal_images]
+            targets = [{k: v.to(device, non_blocking=True) for k, v in t.items()} for t in targets]
             
             optimizer.zero_grad()
             
@@ -96,8 +98,9 @@ def train_one_epoch(model, dataloader, optimizer, device, epoch, scaler=None, us
         else:
             # Single modality - create dummy thermal images for now
             images, targets = batch_data
-            images = [img.to(device) for img in images]
-            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+            # Use non_blocking transfer for faster GPU transfer
+            images = [img.to(device, non_blocking=True) for img in images]
+            targets = [{k: v.to(device, non_blocking=True) for k, v in t.items()} for t in targets]
             
             # For single modality, use same image for both RGB and Thermal
             # (This allows training on HIT-UAV or SMOD alone)
@@ -137,11 +140,12 @@ def train_one_epoch(model, dataloader, optimizer, device, epoch, scaler=None, us
         total_loss += loss.item()
         num_batches += 1
         
-        # Update progress bar
-        progress_bar.set_postfix({
-            'loss': f'{loss.item():.4f}',
-            'avg_loss': f'{total_loss/num_batches:.4f}'
-        })
+        # Update progress bar (less frequently for better performance)
+        if batch_idx % 10 == 0 or batch_idx == len(dataloader) - 1:
+            progress_bar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'avg_loss': f'{total_loss/num_batches:.4f}'
+            })
     
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
     return avg_loss
@@ -210,8 +214,8 @@ def validate(model, dataloader, device, epoch, num_classes):
             if len(batch_data) == 3:
                 # Paired RGB-Thermal
                 rgb_images, thermal_images, targets = batch_data
-                rgb_images = [img.to(device) for img in rgb_images]
-                thermal_images = [img.to(device) for img in thermal_images]
+                rgb_images = [img.to(device, non_blocking=True) for img in rgb_images]
+                thermal_images = [img.to(device, non_blocking=True) for img in thermal_images]
                 
                 # Get predictions with post-processing
                 predictions = model.predict(rgb_images, thermal_images, 
@@ -219,7 +223,7 @@ def validate(model, dataloader, device, epoch, num_classes):
             else:
                 # Single modality
                 images, targets = batch_data
-                images = [img.to(device) for img in images]
+                images = [img.to(device, non_blocking=True) for img in images]
                 thermal_images = images
                 
                 # Get predictions with post-processing
@@ -275,8 +279,12 @@ def main():
                        help='Number of classes (DroneRGBT: 2=background+person, SMOD: 3=background+person+vehicle, HIT-UAV: 6)')
     parser.add_argument('--checkpoint_dir', type=str, default='sggf_net/checkpoints',
                        help='Checkpoint directory')
-    parser.add_argument('--batch_size', type=int, default=4,
-                       help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=8,
+                       help='Batch size (default: 8, increase if GPU memory allows)')
+    parser.add_argument('--num_workers', type=int, default=4,
+                       help='Number of data loading workers (default: 4, increase for faster loading)')
+    parser.add_argument('--prefetch_factor', type=int, default=2,
+                       help='Number of batches to prefetch per worker (default: 2)')
     parser.add_argument('--epochs', type=int, default=100,
                        help='Number of epochs')
     parser.add_argument('--lr', type=float, default=1e-4,
@@ -299,6 +307,14 @@ def main():
     # Device setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
+    
+    # Optimize CUDA settings for faster training
+    if device.type == 'cuda':
+        # Enable cuDNN benchmark for consistent input sizes (faster convolutions)
+        torch.backends.cudnn.benchmark = True
+        # Enable deterministic mode only if reproducibility is needed (slower)
+        # torch.backends.cudnn.deterministic = False
+        print('✓ CUDA optimizations enabled (cuDNN benchmark)')
     
     # Create checkpoint directory
     os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -404,17 +420,33 @@ def main():
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
     
-    # Disable pin_memory on MPS (not supported)
+    # Optimize DataLoader settings for faster data loading
     pin_memory = device.type == 'cuda'
+    persistent_workers = args.num_workers > 0  # Keep workers alive between epochs
     
     train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True,
-        collate_fn=collate_fn, num_workers=2, pin_memory=pin_memory
+        train_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=True,
+        collate_fn=collate_fn, 
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
+        drop_last=True  # Drop last incomplete batch for consistent batch sizes
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=False,
-        collate_fn=collate_fn, num_workers=2, pin_memory=pin_memory
+        val_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=False,
+        collate_fn=collate_fn, 
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None
     )
+    
+    print(f'✓ DataLoader optimized: {args.num_workers} workers, prefetch={args.prefetch_factor}, pin_memory={pin_memory}')
     
     # Create model
     model = FusionYOLOv11(
@@ -423,6 +455,16 @@ def main():
         fusion_type='concat_attention'
     )
     model = model.to(device)
+    
+    # Compile model for faster execution (PyTorch 2.0+)
+    try:
+        if hasattr(torch, 'compile'):
+            print('✓ Compiling model with torch.compile() for faster execution...')
+            model = torch.compile(model, mode='reduce-overhead')
+            print('✓ Model compilation successful')
+    except Exception as e:
+        print(f'⚠ Model compilation not available or failed: {e}')
+        print('  Continuing without compilation...')
     
     # Transfer Learning: Freeze early backbone layers BEFORE creating optimizer
     # This ensures optimizer only includes trainable parameters
