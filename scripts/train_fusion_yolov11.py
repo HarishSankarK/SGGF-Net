@@ -65,7 +65,7 @@ def collate_fn_combined(batch):
     return rgb_images, thermal_images, targets
 
 
-def train_one_epoch(model, dataloader, optimizer, device, epoch, scaler=None, use_amp=False):
+def train_one_epoch(model, dataloader, optimizer, device, epoch, scaler=None, use_amp=False, grad_clip=1.0):
     """Train for one epoch"""
     model.train()
     total_loss = 0.0
@@ -113,12 +113,25 @@ def train_one_epoch(model, dataloader, optimizer, device, epoch, scaler=None, us
                 loss_dict = model(images, thermal_images, targets)
                 loss = sum(loss for loss in loss_dict.values())
         
+        # Check for NaN/Inf loss before backward pass (applies to both paired and single modality)
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f'\n⚠️  Warning: NaN/Inf loss detected at batch {batch_idx}! Skipping batch...')
+            optimizer.zero_grad()
+            continue
+        
         if use_amp and device.type == 'cuda':
             scaler.scale(loss).backward()
+            # Gradient clipping before optimizer step
+            if grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
+            # Gradient clipping before optimizer step
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
         
         total_loss += loss.item()
@@ -266,14 +279,16 @@ def main():
                        help='Batch size')
     parser.add_argument('--epochs', type=int, default=100,
                        help='Number of epochs')
-    parser.add_argument('--lr', type=float, default=1e-3,
-                       help='Learning rate')
+    parser.add_argument('--lr', type=float, default=1e-4,
+                       help='Learning rate (default: 1e-4 for transfer learning, use 1e-3 for full training)')
     parser.add_argument('--resume', type=str, default=None,
                        help='Resume from checkpoint (path to .pth file, or "latest" or "best" to auto-detect)')
     parser.add_argument('--auto_resume', action='store_true',
                        help='Automatically resume from latest.pth if it exists')
     parser.add_argument('--use_amp', action='store_true',
                        help='Use mixed precision training')
+    parser.add_argument('--grad_clip', type=float, default=1.0,
+                       help='Gradient clipping value (default: 1.0, set to 0 to disable)')
     parser.add_argument('--freeze_backbone', action='store_true',
                        help='Freeze early ResNet layers (layer0, layer1, layer2) for faster training')
     parser.add_argument('--freeze_epochs', type=int, default=None,
@@ -421,8 +436,11 @@ def main():
     optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=5e-4)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
     
-    # Mixed precision scaler
-    scaler = torch.cuda.amp.GradScaler() if args.use_amp and device.type == 'cuda' else None
+    # Mixed precision scaler (fixed deprecation warning)
+    if args.use_amp and device.type == 'cuda':
+        scaler = torch.amp.GradScaler('cuda')
+    else:
+        scaler = None
     
     # Resume from checkpoint
     start_epoch = 0
@@ -493,7 +511,7 @@ def main():
             print(f'  Adjusted scheduler for {remaining_epochs} remaining epochs')
         # Train
         train_loss = train_one_epoch(
-            model, train_loader, optimizer, device, epoch, scaler, args.use_amp
+            model, train_loader, optimizer, device, epoch, scaler, args.use_amp, args.grad_clip
         )
         
         # Validate
