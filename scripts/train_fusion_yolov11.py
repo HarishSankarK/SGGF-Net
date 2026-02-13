@@ -380,6 +380,14 @@ def main():
     
     args = parser.parse_args()
     
+    # combined_all defaults: 100% HIT-UAV, 50% DroneRGBT, 25% SMOD (override defaults if not explicitly set)
+    argv_str = ' '.join(sys.argv)
+    if args.dataset == 'combined_all':
+        if '--dronergbt_subset_ratio' not in argv_str:
+            args.dronergbt_subset_ratio = 0.5
+        if '--smod_subset_ratio' not in argv_str:
+            args.smod_subset_ratio = 0.25
+    
     # Device setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
