@@ -44,7 +44,9 @@ def decode_bbox(predictions, grid_points, stride):
     if predictions.dim() == 4:
         # Full feature map: (B, H, W, 4)
         B, H, W, _ = predictions.shape
-        # Expand grid points to batch
+        # grid_points may be (H, W, 2) or (1, H, W, 2) - squash to (H, W, 2)
+        if grid_points.dim() == 4:
+            grid_points = grid_points.squeeze(0)
         grid = grid_points.unsqueeze(0).expand(B, H, W, 2)  # (B, H, W, 2)
         
         # Decode predictions
@@ -292,8 +294,8 @@ def post_process_predictions(predictions, grid_points_list, strides, conf_thresh
             # Combined confidence
             conf = obj_prob.unsqueeze(-1) * cls_prob  # (H, W, num_classes)
             
-            # Decode boxes
-            boxes = decode_bbox(bbox_pred.unsqueeze(0), grid_points.unsqueeze(0), stride)[0]  # (H, W, 4)
+            # Decode boxes (grid_points is (H, W, 2); decode_bbox expects that and adds batch dim internally)
+            boxes = decode_bbox(bbox_pred.unsqueeze(0), grid_points, stride)[0]  # (H, W, 4)
             
             # Filter by confidence
             mask = conf > conf_threshold  # (H, W, num_classes)
