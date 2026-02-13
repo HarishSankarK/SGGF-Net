@@ -173,8 +173,8 @@ def main():
                        default='sggf_net/data/SMOD',
                        help='SMOD dataset directory (for combined evaluation)')
     parser.add_argument('--hituav_dir', type=str,
-                       default='sggf_net/data/HIT-UAV',
-                       help='HIT-UAV dataset directory (for combined_all)')
+                       default='data/hit-uav',
+                       help='HIT-UAV dataset directory (data/hit-uav or data/HIT-UAV)')
     parser.add_argument('--checkpoint', type=str, required=True,
                        help='Path to model checkpoint')
     parser.add_argument('--num_classes', type=int, default=2,

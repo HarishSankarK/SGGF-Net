@@ -101,11 +101,9 @@ class Pad:
         return image, target
 
 
-def get_train_transform(max_size=1536, multi_scale=False):
-    """Get training transforms with data augmentation"""
-    # Use multi-scale if enabled (randomly sample from [1024, 1280, 1536])
-    # Pad to maximum size to ensure consistent batch shapes
-    max_pad_size = max_size if not multi_scale else 1536
+def get_train_transform(max_size=640, multi_scale=False):
+    """Get training transforms with data augmentation (default 640 for Colab T4 OOM avoidance)"""
+    max_pad_size = max_size if not multi_scale else min(1536, max_size * 2)
     return Compose([
         ToTensor(),
         RandomHorizontalFlip(prob=0.5),
@@ -114,7 +112,7 @@ def get_train_transform(max_size=1536, multi_scale=False):
     ])
 
 
-def get_val_transform(max_size=1536):
+def get_val_transform(max_size=640):
     """Get validation transforms (no augmentation)"""
     return Compose([
         ToTensor(),

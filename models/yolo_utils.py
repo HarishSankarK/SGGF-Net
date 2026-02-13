@@ -94,17 +94,17 @@ def decode_bbox(predictions, grid_points, stride):
         return boxes
 
 
-def compute_iou(boxes1, boxes2):
+def compute_iou(boxes1, boxes2, chunk_size=8192):
     """
-    Compute IoU between two sets of boxes
+    Compute IoU between two sets of boxes. Uses chunking to avoid OOM on large matrices.
     
     Args:
         boxes1: (N, 4) in (x_center, y_center, w, h) format
         boxes2: (M, 4) in (x_center, y_center, w, h) format
+        chunk_size: Process boxes1 in chunks to limit memory (default 8192)
     Returns:
         iou: (N, M) IoU matrix
     """
-    # Convert to corner format
     def to_corners(boxes):
         x, y, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
         x1 = x - w / 2
@@ -113,33 +113,30 @@ def compute_iou(boxes1, boxes2):
         y2 = y + h / 2
         return torch.stack([x1, y1, x2, y2], dim=1)
     
-    boxes1_corners = to_corners(boxes1)  # (N, 4)
-    boxes2_corners = to_corners(boxes2)  # (M, 4)
+    N, M = boxes1.shape[0], boxes2.shape[0]
+    # Chunk boxes1 to avoid (N, M) matrix OOM when N*M is large (e.g. 36k*100=3.6M floats)
+    if N <= chunk_size:
+        # Small enough - compute directly
+        boxes1_corners = to_corners(boxes1)
+        boxes2_corners = to_corners(boxes2)
+        boxes1_exp = boxes1_corners.unsqueeze(1)
+        boxes2_exp = boxes2_corners.unsqueeze(0)
+        inter_x1 = torch.max(boxes1_exp[..., 0], boxes2_exp[..., 0])
+        inter_y1 = torch.max(boxes1_exp[..., 1], boxes2_exp[..., 1])
+        inter_x2 = torch.min(boxes1_exp[..., 2], boxes2_exp[..., 2])
+        inter_y2 = torch.min(boxes1_exp[..., 3], boxes2_exp[..., 3])
+        inter_area = torch.clamp(inter_x2 - inter_x1, min=0) * torch.clamp(inter_y2 - inter_y1, min=0)
+        area1 = (boxes1_corners[:, 2] - boxes1_corners[:, 0]) * (boxes1_corners[:, 3] - boxes1_corners[:, 1])
+        area2 = (boxes2_corners[:, 2] - boxes2_corners[:, 0]) * (boxes2_corners[:, 3] - boxes2_corners[:, 1])
+        union_area = area1.unsqueeze(1) + area2.unsqueeze(0) - inter_area
+        return inter_area / (union_area + 1e-7)
     
-    # Expand for broadcasting
-    boxes1_exp = boxes1_corners.unsqueeze(1)  # (N, 1, 4)
-    boxes2_exp = boxes2_corners.unsqueeze(0)  # (1, M, 4)
-    
-    # Compute intersection
-    inter_x1 = torch.max(boxes1_exp[..., 0], boxes2_exp[..., 0])
-    inter_y1 = torch.max(boxes1_exp[..., 1], boxes2_exp[..., 1])
-    inter_x2 = torch.min(boxes1_exp[..., 2], boxes2_exp[..., 2])
-    inter_y2 = torch.min(boxes1_exp[..., 3], boxes2_exp[..., 3])
-    
-    inter_area = torch.clamp(inter_x2 - inter_x1, min=0) * torch.clamp(inter_y2 - inter_y1, min=0)
-    
-    # Compute union
-    area1 = (boxes1_corners[:, 2] - boxes1_corners[:, 0]) * (boxes1_corners[:, 3] - boxes1_corners[:, 1])
-    area2 = (boxes2_corners[:, 2] - boxes2_corners[:, 0]) * (boxes2_corners[:, 3] - boxes2_corners[:, 1])
-    
-    area1_exp = area1.unsqueeze(1)  # (N, 1)
-    area2_exp = area2.unsqueeze(0)  # (1, M)
-    
-    union_area = area1_exp + area2_exp - inter_area
-    
-    iou = inter_area / (union_area + 1e-7)
-    
-    return iou
+    iou_list = []
+    for i in range(0, N, chunk_size):
+        end = min(i + chunk_size, N)
+        chunk = compute_iou(boxes1[i:end], boxes2, chunk_size=chunk_size * 2)
+        iou_list.append(chunk)
+    return torch.cat(iou_list, dim=0)
 
 
 def assign_targets_to_predictions(predictions_list, grid_points_list, strides, targets, image_size, 
@@ -180,11 +177,15 @@ def assign_targets_to_predictions(predictions_list, grid_points_list, strides, t
         obj_targets = torch.zeros(B, H, W, dtype=torch.float32, device=predictions.device)
         cls_targets = torch.zeros(B, H, W, dtype=torch.long, device=predictions.device)
         
+        max_gt_boxes = 100  # Limit to avoid OOM on dense images
         for b in range(B):
             target = targets[b]
             gt_boxes = target['boxes']  # (M, 4) in [x1, y1, x2, y2]
             gt_labels = target['labels']  # (M,)
-            
+            if len(gt_boxes) > max_gt_boxes:
+                perm = torch.randperm(len(gt_boxes), device=gt_boxes.device)[:max_gt_boxes]
+                gt_boxes = gt_boxes[perm]
+                gt_labels = gt_labels[perm]
             if len(gt_boxes) == 0:
                 # No ground truth - all negatives
                 continue

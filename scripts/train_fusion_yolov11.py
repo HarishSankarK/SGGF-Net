@@ -341,8 +341,8 @@ def main():
                        default='sggf_net/data/SMOD',
                        help='SMOD dataset directory (for combined training)')
     parser.add_argument('--hituav_dir', type=str,
-                       default='sggf_net/data/HIT-UAV',
-                       help='HIT-UAV dataset directory (for combined_all)')
+                       default='data/hit-uav',
+                       help='HIT-UAV dataset directory (data/hit-uav or data/HIT-UAV)')
     parser.add_argument('--dronergbt_subset_ratio', type=float, default=1.0,
                        help='Use only this fraction of DroneRGBT (0.0-1.0). E.g. 0.5 for 50%%.')
     parser.add_argument('--smod_subset_ratio', type=float, default=1.0,
@@ -375,6 +375,8 @@ def main():
                        help='Number of epochs to train with frozen backbone, then unfreeze (progressive unfreezing)')
     parser.add_argument('--stage', type=int, default=None, choices=[1, 2, 3],
                        help='Stage-by-stage training (faster): 1=backbone+fusion+head, 2=GFEM only, 3=full fine-tune. Use --resume to chain stages.')
+    parser.add_argument('--max_size', type=int, default=640,
+                       help='Max image size for resize (default 640 for Colab T4, use 1024/1536 if GPU has more memory)')
     
     args = parser.parse_args()
     
@@ -393,9 +395,9 @@ def main():
     # Create checkpoint directory
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     
-    # Load dataset
-    train_transform = get_train_transform()
-    val_transform = get_val_transform()
+    # Load dataset (max_size 640 = Colab T4 safe, reduces OOM and speeds up training)
+    train_transform = get_train_transform(max_size=args.max_size)
+    val_transform = get_val_transform(max_size=args.max_size)
     
     # Set num_classes based on dataset if not explicitly provided
     if args.num_classes == 2:  # Default value
