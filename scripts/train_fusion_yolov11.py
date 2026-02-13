@@ -302,21 +302,20 @@ def validate(model, dataloader, device, epoch, num_classes):
     # Compute metrics
     from utils.metrics import calculate_map, calculate_ap50
     
-    # Convert targets to standard format
+    # Pass tensors on CPU to calculate_map (it uses torch.cat and torch ops)
     formatted_targets = []
     for target in all_targets:
         formatted_targets.append({
-            'boxes': target['boxes'].cpu().numpy(),
-            'labels': target['labels'].cpu().numpy()
+            'boxes': target['boxes'].cpu(),
+            'labels': target['labels'].cpu()
         })
     
-    # Convert predictions to standard format
     formatted_predictions = []
     for pred in all_predictions:
         formatted_predictions.append({
-            'boxes': pred['boxes'].cpu().numpy(),
-            'scores': pred['scores'].cpu().numpy(),
-            'labels': pred['labels'].cpu().numpy()
+            'boxes': pred['boxes'].cpu(),
+            'scores': pred['scores'].cpu(),
+            'labels': pred['labels'].cpu()
         })
     
     # Compute mAP (requires num_classes parameter)
