@@ -8,7 +8,7 @@ import sys
 import argparse
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, ConcatDataset
+from torch.utils.data import DataLoader, ConcatDataset, Subset
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import numpy as np
@@ -112,9 +112,21 @@ def train_one_epoch(model, dataloader, optimizer, device, epoch, scaler=None, us
                 with torch.autocast(device_type='cuda', dtype=torch.float16):
                     loss_dict = model(images, thermal_images, targets)
                     loss = sum(loss for loss in loss_dict.values())
+                    # Check for NaN in individual loss components
+                    if any(torch.isnan(l) or torch.isinf(l) for l in loss_dict.values()):
+                        print(f'\n⚠️  Warning: NaN/Inf in loss components at batch {batch_idx}!')
+                        for k, v in loss_dict.items():
+                            if torch.isnan(v) or torch.isinf(v):
+                                print(f'  {k}: {v.item()}')
             else:
                 loss_dict = model(images, thermal_images, targets)
                 loss = sum(loss for loss in loss_dict.values())
+                # Check for NaN in individual loss components
+                if any(torch.isnan(l) or torch.isinf(l) for l in loss_dict.values()):
+                    print(f'\n⚠️  Warning: NaN/Inf in loss components at batch {batch_idx}!')
+                    for k, v in loss_dict.items():
+                        if torch.isnan(v) or torch.isinf(v):
+                            print(f'  {k}: {v.item()}')
         
         # Check for NaN/Inf loss before backward pass (applies to both paired and single modality)
         if torch.isnan(loss) or torch.isinf(loss):
@@ -201,6 +213,59 @@ def unfreeze_all_layers(model):
     print('✓ Unfrozen all layers')
 
 
+def freeze_for_stage(model, stage):
+    """
+    Stage-by-stage training for FusionYOLOv11 (speeds up training).
+    
+    Stage 1: Train backbone (layer3, layer4) + fusion + PANet + head
+             Frozen: GFEM (transformer), backbone layer0/1/2
+    Stage 2: Train only GFEM modules (freeze everything else)
+    Stage 3: Full fine-tuning (unfreeze all, lower LR)
+    """
+    # First freeze everything
+    for param in model.parameters():
+        param.requires_grad = False
+    
+    if stage == 1:
+        # Unfreeze: backbone layer3, layer4 + fusion_conv + fusion modules + panet + detection_head
+        freeze_layers = ['layer0', 'layer1', 'layer2']
+        for name, param in model.dual_stream.rgb_backbone.named_parameters():
+            if not any(l in name for l in freeze_layers):
+                param.requires_grad = True
+        for name, param in model.dual_stream.thermal_backbone.named_parameters():
+            if not any(l in name for l in freeze_layers):
+                param.requires_grad = True
+        for param in model.dual_stream.rgb_fusion_conv.parameters():
+            param.requires_grad = True
+        for param in model.dual_stream.thermal_fusion_conv.parameters():
+            param.requires_grad = True
+        for m in [model.fusion_c2, model.fusion_c3, model.fusion_c4, model.fusion_c5]:
+            for param in m.parameters():
+                param.requires_grad = True
+        for param in model.panet.parameters():
+            param.requires_grad = True
+        for param in model.detection_head.parameters():
+            param.requires_grad = True
+        print('✓ Stage 1: Training backbone (layer3,4) + fusion + PANet + head')
+        print('  Frozen: GFEM, backbone layer0/1/2')
+    elif stage == 2:
+        # Unfreeze only GFEM
+        for param in model.dual_stream.rgb_gfem.parameters():
+            param.requires_grad = True
+        for param in model.dual_stream.thermal_gfem.parameters():
+            param.requires_grad = True
+        # Also train fusion_conv (small, connects GFEM to backbone)
+        for param in model.dual_stream.rgb_fusion_conv.parameters():
+            param.requires_grad = True
+        for param in model.dual_stream.thermal_fusion_conv.parameters():
+            param.requires_grad = True
+        print('✓ Stage 2: Training only GFEM + fusion_conv')
+        print('  Frozen: Backbone, fusion modules, PANet, detection head')
+    else:  # stage == 3
+        unfreeze_all_layers(model)
+        print('✓ Stage 3: Full fine-tuning (all layers)')
+
+
 def validate(model, dataloader, device, epoch, num_classes):
     """Validate model"""
     model.eval()
@@ -264,8 +329,8 @@ def validate(model, dataloader, device, epoch, num_classes):
 def main():
     parser = argparse.ArgumentParser(description='Train Fusion-YOLOv11')
     parser.add_argument('--dataset', type=str, default='dronergbt',
-                       choices=['dronergbt', 'hituav', 'smod', 'combined'],
-                       help='Dataset to use')
+                       choices=['dronergbt', 'hituav', 'smod', 'combined', 'combined_all'],
+                       help='Dataset: combined_all = HIT-UAV + DroneRGBT + SMOD in one cmd')
     parser.add_argument('--data_dir', type=str, 
                        default='sggf_net/data/dronergbt',
                        help='Dataset root directory (for single dataset)')
@@ -275,6 +340,13 @@ def main():
     parser.add_argument('--smod_dir', type=str,
                        default='sggf_net/data/SMOD',
                        help='SMOD dataset directory (for combined training)')
+    parser.add_argument('--hituav_dir', type=str,
+                       default='sggf_net/data/HIT-UAV',
+                       help='HIT-UAV dataset directory (for combined_all)')
+    parser.add_argument('--dronergbt_subset_ratio', type=float, default=1.0,
+                       help='Use only this fraction of DroneRGBT (0.0-1.0). E.g. 0.5 for 50%%.')
+    parser.add_argument('--smod_subset_ratio', type=float, default=1.0,
+                       help='Use only this fraction of SMOD (0.0-1.0). E.g. 0.25 for 25%%.')
     parser.add_argument('--num_classes', type=int, default=2,
                        help='Number of classes (DroneRGBT: 2=background+person, SMOD: 3=background+person+vehicle, HIT-UAV: 6)')
     parser.add_argument('--checkpoint_dir', type=str, default='sggf_net/checkpoints',
@@ -287,8 +359,8 @@ def main():
                        help='Number of batches to prefetch per worker (default: 2)')
     parser.add_argument('--epochs', type=int, default=100,
                        help='Number of epochs')
-    parser.add_argument('--lr', type=float, default=1e-4,
-                       help='Learning rate (default: 1e-4 for transfer learning, use 1e-3 for full training)')
+    parser.add_argument('--lr', type=float, default=5e-5,
+                       help='Learning rate (default: 5e-5 for transfer learning, use 1e-4 for full training)')
     parser.add_argument('--resume', type=str, default=None,
                        help='Resume from checkpoint (path to .pth file, or "latest" or "best" to auto-detect)')
     parser.add_argument('--auto_resume', action='store_true',
@@ -301,6 +373,8 @@ def main():
                        help='Freeze early ResNet layers (layer0, layer1, layer2) for faster training')
     parser.add_argument('--freeze_epochs', type=int, default=None,
                        help='Number of epochs to train with frozen backbone, then unfreeze (progressive unfreezing)')
+    parser.add_argument('--stage', type=int, default=None, choices=[1, 2, 3],
+                       help='Stage-by-stage training (faster): 1=backbone+fusion+head, 2=GFEM only, 3=full fine-tune. Use --resume to chain stages.')
     
     args = parser.parse_args()
     
@@ -331,8 +405,10 @@ def main():
             args.num_classes = 2  # DroneRGBT: background + person
         elif args.dataset == 'combined':
             args.num_classes = 3  # Combined: background + person + vehicle
+        elif args.dataset == 'combined_all':
+            args.num_classes = 3  # person + vehicle (HIT-UAV maps Car/Bicycle/OtherVehicle→vehicle, DontCare→skip)
         elif args.dataset == 'hituav':
-            args.num_classes = 6  # HIT-UAV: 6 classes
+            args.num_classes = 3  # HIT-UAV: person + vehicle (Person→person, Car/Bicycle/OtherVehicle→vehicle)
     
     if args.dataset == 'dronergbt':
         train_dataset = DroneRGBTDataset(
@@ -344,10 +420,10 @@ def main():
         collate_fn = collate_fn_paired
     elif args.dataset == 'hituav':
         train_dataset = HITUAVDataset(
-            root_dir=args.data_dir, split='train', transform=train_transform
+            root_dir=args.data_dir, split='train', transform=train_transform, use_person_vehicle=True
         )
         val_dataset = HITUAVDataset(
-            root_dir=args.data_dir, split='val', transform=val_transform
+            root_dir=args.data_dir, split='val', transform=val_transform, use_person_vehicle=True
         )
         collate_fn = collate_fn_single
     elif args.dataset == 'smod':
@@ -357,6 +433,15 @@ def main():
         val_dataset = SMODDataset(
             root_dir=args.data_dir, split='val', transform=val_transform
         )
+        if args.smod_subset_ratio < 1.0:
+            rng = torch.Generator().manual_seed(42)
+            n_train = len(train_dataset)
+            n_val = len(val_dataset)
+            keep_train = max(1, int(n_train * args.smod_subset_ratio))
+            keep_val = max(1, int(n_val * args.smod_subset_ratio))
+            train_dataset = Subset(train_dataset, torch.randperm(n_train, generator=rng)[:keep_train].tolist())
+            val_dataset = Subset(val_dataset, torch.randperm(n_val, generator=rng)[:keep_val].tolist())
+            print(f"SMOD subset: {keep_train}/{n_train} train, {keep_val}/{n_val} val ({args.smod_subset_ratio*100:.0f}%)")
         collate_fn = collate_fn_single
     elif args.dataset == 'combined':
         # Combined dataset: DroneRGBT + SMOD
@@ -395,6 +480,19 @@ def main():
             raise ValueError(f"Failed to load DroneRGBT dataset: {e}\n"
                            f"Please ensure DroneRGBT dataset is preprocessed correctly.")
         
+        # Optionally use only a subset of DroneRGBT
+        if args.dronergbt_subset_ratio < 1.0:
+            rng = torch.Generator().manual_seed(42)
+            n_train = len(dronergbt_train)
+            n_val = len(dronergbt_val)
+            keep_train = max(1, int(n_train * args.dronergbt_subset_ratio))
+            keep_val = max(1, int(n_val * args.dronergbt_subset_ratio))
+            idx_train = torch.randperm(n_train, generator=rng)[:keep_train].tolist()
+            idx_val = torch.randperm(n_val, generator=rng)[:keep_val].tolist()
+            dronergbt_train = Subset(dronergbt_train, idx_train)
+            dronergbt_val = Subset(dronergbt_val, idx_val)
+            print(f"  DroneRGBT subset: {keep_train}/{n_train} train, {keep_val}/{n_val} val ({args.dronergbt_subset_ratio*100:.0f}%)")
+        
         # Load SMOD dataset
         try:
             smod_train = SMODDataset(
@@ -408,6 +506,19 @@ def main():
                            f"Please ensure SMOD dataset structure is correct.\n"
                            f"Expected: {args.smod_dir}/images/train/ and {args.smod_dir}/labels/train/")
         
+        # Optionally use only a subset of SMOD (for faster training)
+        if args.smod_subset_ratio < 1.0:
+            rng = torch.Generator().manual_seed(42)
+            n_train = len(smod_train)
+            n_val = len(smod_val)
+            keep_train = max(1, int(n_train * args.smod_subset_ratio))
+            keep_val = max(1, int(n_val * args.smod_subset_ratio))
+            idx_train = torch.randperm(n_train, generator=rng)[:keep_train].tolist()
+            idx_val = torch.randperm(n_val, generator=rng)[:keep_val].tolist()
+            smod_train = Subset(smod_train, idx_train)
+            smod_val = Subset(smod_val, idx_val)
+            print(f"  SMOD subset: {keep_train}/{n_train} train, {keep_val}/{n_val} val ({args.smod_subset_ratio*100:.0f}%)")
+        
         # Concatenate datasets
         train_dataset = ConcatDataset([dronergbt_train, smod_train])
         val_dataset = ConcatDataset([dronergbt_val, smod_val])
@@ -417,6 +528,44 @@ def main():
         print(f"✓ Combined dataset loaded:")
         print(f"  Train: {len(dronergbt_train)} DroneRGBT + {len(smod_train)} SMOD = {len(train_dataset)} total")
         print(f"  Val: {len(dronergbt_val)} DroneRGBT + {len(smod_val)} SMOD = {len(val_dataset)} total")
+    elif args.dataset == 'combined_all':
+        # Combined_all: full HIT-UAV + 50% DroneRGBT + 25% SMOD (or custom ratios via args)
+        print("Loading combined_all dataset (HIT-UAV + DroneRGBT + SMOD)...")
+        for name, path in [('HIT-UAV', args.hituav_dir), ('DroneRGBT', args.dronergbt_dir), ('SMOD', args.smod_dir)]:
+            if not os.path.exists(path):
+                raise ValueError(f"{name} directory not found: {path}\nSee PREPROCESSING.md for setup.")
+        
+        # Load HIT-UAV (full)
+        try:
+            hituav_train = HITUAVDataset(root_dir=args.hituav_dir, split='train', transform=train_transform, use_person_vehicle=True)
+            hituav_val = HITUAVDataset(root_dir=args.hituav_dir, split='val', transform=val_transform, use_person_vehicle=True)
+        except Exception as e:
+            raise ValueError(f"Failed to load HIT-UAV: {e}\nRun: python scripts/preprocess_hituav.py --help")
+        
+        # Load DroneRGBT with subset
+        dronergbt_train = DroneRGBTDataset(root_dir=args.dronergbt_dir, split='train', transform=train_transform)
+        dronergbt_val = DroneRGBTDataset(root_dir=args.dronergbt_dir, split='val', transform=val_transform)
+        if args.dronergbt_subset_ratio < 1.0:
+            rng = torch.Generator().manual_seed(42)
+            n_tr, n_v = len(dronergbt_train), len(dronergbt_val)
+            dronergbt_train = Subset(dronergbt_train, torch.randperm(n_tr, generator=rng)[:max(1, int(n_tr * args.dronergbt_subset_ratio))].tolist())
+            dronergbt_val = Subset(dronergbt_val, torch.randperm(n_v, generator=rng)[:max(1, int(n_v * args.dronergbt_subset_ratio))].tolist())
+            print(f"  DroneRGBT subset: {len(dronergbt_train)}/{n_tr} train ({args.dronergbt_subset_ratio*100:.0f}%)")
+        
+        # Load SMOD with subset
+        smod_train = SMODDataset(root_dir=args.smod_dir, split='train', transform=train_transform)
+        smod_val = SMODDataset(root_dir=args.smod_dir, split='val', transform=val_transform)
+        if args.smod_subset_ratio < 1.0:
+            rng = torch.Generator().manual_seed(42)
+            n_tr, n_v = len(smod_train), len(smod_val)
+            smod_train = Subset(smod_train, torch.randperm(n_tr, generator=rng)[:max(1, int(n_tr * args.smod_subset_ratio))].tolist())
+            smod_val = Subset(smod_val, torch.randperm(n_v, generator=rng)[:max(1, int(n_v * args.smod_subset_ratio))].tolist())
+            print(f"  SMOD subset: {len(smod_train)}/{n_tr} train ({args.smod_subset_ratio*100:.0f}%)")
+        
+        train_dataset = ConcatDataset([hituav_train, dronergbt_train, smod_train])
+        val_dataset = ConcatDataset([hituav_val, dronergbt_val, smod_val])
+        collate_fn = collate_fn_combined
+        print(f"✓ Combined_all loaded: {len(hituav_train)} HIT-UAV + {len(dronergbt_train)} DroneRGBT + {len(smod_train)} SMOD = {len(train_dataset)} train")
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
     
@@ -457,18 +606,29 @@ def main():
     model = model.to(device)
     
     # Compile model for faster execution (PyTorch 2.0+)
-    try:
-        if hasattr(torch, 'compile'):
-            print('✓ Compiling model with torch.compile() for faster execution...')
-            model = torch.compile(model, mode='reduce-overhead')
-            print('✓ Model compilation successful')
-    except Exception as e:
-        print(f'⚠ Model compilation not available or failed: {e}')
-        print('  Continuing without compilation...')
+    # DISABLED: torch.compile() is causing NaN losses with this model architecture
+    # The CUDAGraph warnings and dynamic shapes are causing instability
+    # Uncomment below if you want to try compilation (not recommended)
+    # try:
+    #     if hasattr(torch, 'compile'):
+    #         print('✓ Compiling model with torch.compile() for faster execution...')
+    #         model = torch.compile(model, mode='reduce-overhead')
+    #         print('✓ Model compilation successful')
+    # except Exception as e:
+    #     print(f'⚠ Model compilation not available or failed: {e}')
+    #     print('  Continuing without compilation...')
+    print('⚠ Model compilation disabled (causes NaN losses with this architecture)')
     
-    # Transfer Learning: Freeze early backbone layers BEFORE creating optimizer
-    # This ensures optimizer only includes trainable parameters
-    if args.freeze_backbone:
+    # Stage-by-stage OR transfer learning: freeze layers BEFORE creating optimizer
+    if args.stage is not None:
+        freeze_for_stage(model, args.stage)
+        # Stage-specific epochs and learning rate (shorter = faster per stage)
+        stage_epochs = {1: 30, 2: 20, 3: 30}  # Total ~80 epochs across 3 stages
+        stage_lr = {1: 5e-5, 2: 1e-5, 3: 5e-6}
+        args.epochs = stage_epochs.get(args.stage, args.epochs)
+        args.lr = stage_lr.get(args.stage, args.lr)
+        print(f'  Stage {args.stage}: {args.epochs} epochs, lr={args.lr}')
+    elif args.freeze_backbone:
         freeze_backbone_layers(model, freeze_early=True)
     else:
         print('✓ Training all layers (no freezing)')
@@ -508,30 +668,30 @@ def main():
             print('Starting training from scratch...')
         else:
             print(f'Loading checkpoint: {args.resume}')
-            checkpoint = torch.load(args.resume, map_location=device)
+            try:
+                checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
+            except TypeError:
+                checkpoint = torch.load(args.resume, map_location=device)
             model.load_state_dict(checkpoint['model_state_dict'])
-            
-            # Note: When resuming with frozen layers, optimizer state may not match
-            # We'll try to load it, but recreate if needed
+            # Note: When resuming with frozen layers or different stage, optimizer state may not match
             try:
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            except:
-                print('  Warning: Optimizer state mismatch (possibly due to freezing). Recreating optimizer...')
+            except Exception:
+                print('  Warning: Optimizer state mismatch (possibly due to freezing/stage). Recreating optimizer...')
                 trainable_params = [p for p in model.parameters() if p.requires_grad]
                 optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=5e-4)
-            
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            start_epoch = checkpoint['epoch']
+            if 'scheduler_state_dict' in checkpoint:
+                try:
+                    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                except Exception:
+                    pass
+            start_epoch = 0  # Start from 0 when chaining stages
             best_map = checkpoint.get('best_map', 0.0)
-            
-            # Load scaler state if it exists and we're using AMP
             if scaler is not None and 'scaler_state_dict' in checkpoint:
                 scaler.load_state_dict(checkpoint['scaler_state_dict'])
-                print(f'  Loaded scaler state')
-            
-            print(f'  Resumed from epoch {start_epoch}')
-            print(f'  Best mAP so far: {best_map:.4f}')
-            print(f'  Continuing training from epoch {start_epoch} to {args.epochs}')
+                print('  Loaded scaler state')
+            print(f'  Resumed: Best mAP so far: {best_map:.4f}')
+            print(f'  Continuing training from epoch 0 to {args.epochs}')
     
     # Training loop
     print(f'Starting training for {args.epochs} epochs...')
@@ -575,7 +735,8 @@ def main():
             'best_map': best_map,
             'val_map': val_map,
             'val_ap50': val_ap50,
-            'args': vars(args)  # Save training arguments for reference
+            'args': vars(args),
+            'stage': args.stage
         }
         
         # Save scaler state if using AMP
@@ -596,6 +757,16 @@ def main():
             print(f'  ✓ Saved best model (mAP: {best_map:.4f}): {best_path}')
     
     print(f'Training completed! Best mAP: {best_map:.4f}')
+    
+    # Hint for stage chaining
+    if args.stage is not None and args.stage < 3:
+        next_stage = args.stage + 1
+        best_path = os.path.join(args.checkpoint_dir, 'best.pth')
+        print(f'\n💡 To continue with Stage {next_stage}, run:')
+        extra = f'--dataset {args.dataset} --dronergbt_dir {args.dronergbt_dir} --smod_dir {args.smod_dir}'
+        if args.dataset == 'combined_all':
+            extra += f' --hituav_dir {args.hituav_dir}'
+        print(f'   python scripts/train_fusion_yolov11.py --stage {next_stage} --resume {best_path} {extra}')
 
 
 if __name__ == '__main__':

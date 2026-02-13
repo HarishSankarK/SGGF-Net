@@ -161,7 +161,7 @@ def evaluate(model, dataloader, device, num_classes, conf_threshold=0.5, nms_thr
 def main():
     parser = argparse.ArgumentParser(description='Evaluate Fusion-YOLOv11')
     parser.add_argument('--dataset', type=str, default='dronergbt',
-                       choices=['dronergbt', 'hituav', 'smod', 'combined'],
+                       choices=['dronergbt', 'hituav', 'smod', 'combined', 'combined_all'],
                        help='Dataset to evaluate on')
     parser.add_argument('--data_dir', type=str, 
                        default='sggf_net/data/dronergbt',
@@ -172,6 +172,9 @@ def main():
     parser.add_argument('--smod_dir', type=str,
                        default='sggf_net/data/SMOD',
                        help='SMOD dataset directory (for combined evaluation)')
+    parser.add_argument('--hituav_dir', type=str,
+                       default='sggf_net/data/HIT-UAV',
+                       help='HIT-UAV dataset directory (for combined_all)')
     parser.add_argument('--checkpoint', type=str, required=True,
                        help='Path to model checkpoint')
     parser.add_argument('--num_classes', type=int, default=2,
@@ -200,8 +203,10 @@ def main():
             args.num_classes = 2  # DroneRGBT: background + person
         elif args.dataset == 'combined':
             args.num_classes = 3  # Combined: background + person + vehicle
+        elif args.dataset == 'combined_all':
+            args.num_classes = 3  # person + vehicle (HIT-UAV remapped)
         elif args.dataset == 'hituav':
-            args.num_classes = 6  # HIT-UAV: 6 classes
+            args.num_classes = 3  # HIT-UAV: person + vehicle
     
     # Load dataset
     val_transform = get_val_transform()
@@ -213,7 +218,7 @@ def main():
         collate_fn = collate_fn_paired
     elif args.dataset == 'hituav':
         dataset = HITUAVDataset(
-            root_dir=args.data_dir, split=args.split, transform=val_transform
+            root_dir=args.data_dir, split=args.split, transform=val_transform, use_person_vehicle=True
         )
         collate_fn = collate_fn_single
     elif args.dataset == 'smod':
@@ -236,6 +241,13 @@ def main():
         collate_fn = collate_fn_combined
         
         print(f"✓ Combined dataset loaded: {len(dronergbt_dataset)} DroneRGBT + {len(smod_dataset)} SMOD = {len(dataset)} total")
+    elif args.dataset == 'combined_all':
+        hituav_ds = HITUAVDataset(root_dir=args.hituav_dir, split=args.split, transform=val_transform, use_person_vehicle=True)
+        dronergbt_ds = DroneRGBTDataset(root_dir=args.dronergbt_dir, split=args.split, transform=val_transform)
+        smod_ds = SMODDataset(root_dir=args.smod_dir, split=args.split, transform=val_transform)
+        dataset = ConcatDataset([hituav_ds, dronergbt_ds, smod_ds])
+        collate_fn = collate_fn_combined
+        print(f"✓ Combined_all loaded: {len(hituav_ds)} HIT-UAV + {len(dronergbt_ds)} DroneRGBT + {len(smod_ds)} SMOD = {len(dataset)} total")
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
     
