@@ -204,20 +204,34 @@ def assign_targets_to_predictions(predictions_list, grid_points_list, strides, t
             pred_boxes_flat = decoded_boxes_flat[b]  # (H*W, 4)
             iou_matrix = compute_iou(pred_boxes_flat, gt_boxes_center)  # (H*W, M)
             
-            # Find best match for each prediction
+            # Find best GT match for each prediction
             max_iou, matched_gt_idx = iou_matrix.max(dim=1)  # (H*W,)
-            
-            # Assign labels
+
+            # Base assignment from IoU thresholds
             pos_mask = max_iou >= pos_threshold
             neg_mask = max_iou < neg_threshold
-            
-            labels[b][pos_mask.reshape(H, W)] = gt_labels[matched_gt_idx[pos_mask]]
+
+            # Stability fix: force at least one positive prediction per GT.
+            # Without this, training can collapse to all-negative samples.
+            best_pred_per_gt = iou_matrix.argmax(dim=0)  # (M,)
+            force_pos_mask = torch.zeros_like(pos_mask)
+            force_pos_mask[best_pred_per_gt] = True
+            pos_mask = pos_mask | force_pos_mask
+            neg_mask = neg_mask & (~pos_mask)
+
+            # Ensure forced positives are matched to their corresponding GT.
+            assigned_gt_idx = matched_gt_idx.clone()
+            assigned_gt_idx[best_pred_per_gt] = torch.arange(
+                gt_boxes_center.shape[0], device=gt_boxes_center.device
+            )
+
+            labels[b][pos_mask.reshape(H, W)] = gt_labels[assigned_gt_idx[pos_mask]]
             obj_targets[b][pos_mask.reshape(H, W)] = 1.0
             obj_targets[b][neg_mask.reshape(H, W)] = 0.0
             
             # Assign bbox targets (only for positives)
             if pos_mask.any():
-                matched_gt = gt_boxes_center[matched_gt_idx[pos_mask]]  # (N_pos, 4)
+                matched_gt = gt_boxes_center[assigned_gt_idx[pos_mask]]  # (N_pos, 4)
                 matched_pred = pred_boxes_flat[pos_mask]  # (N_pos, 4)
                 
                 # Compute bbox deltas
@@ -231,7 +245,7 @@ def assign_targets_to_predictions(predictions_list, grid_points_list, strides, t
                 # Reshape and assign
                 pos_indices = torch.where(pos_mask.reshape(H, W))
                 bbox_targets[b][pos_indices] = bbox_deltas
-                cls_targets[b][pos_indices] = gt_labels[matched_gt_idx[pos_mask]]
+                cls_targets[b][pos_indices] = gt_labels[assigned_gt_idx[pos_mask]]
         
         assigned_targets.append({
             'labels': labels,
@@ -293,6 +307,10 @@ def post_process_predictions(predictions, grid_points_list, strides, conf_thresh
             
             # Combined confidence
             conf = obj_prob.unsqueeze(-1) * cls_prob  # (H, W, num_classes)
+            # Class id 0 is reserved for background in this codebase.
+            # Exclude it from candidate detections.
+            if num_classes > 1:
+                conf[..., 0] = 0.0
             
             # Decode boxes (grid_points is (H, W, 2); decode_bbox expects that and adds batch dim internally)
             boxes = decode_bbox(bbox_pred.unsqueeze(0), grid_points, stride)[0]  # (H, W, 4)

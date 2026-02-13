@@ -12,8 +12,8 @@ def calculate_iou(boxes1, boxes2):
     Calculate IoU between two sets of boxes
     
     Args:
-        boxes1: (N, 4) tensor in format [x_center, y_center, width, height]
-        boxes2: (M, 4) tensor in format [x_center, y_center, width, height]
+        boxes1: (N, 4) tensor in format [x1, y1, x2, y2]
+        boxes2: (M, 4) tensor in format [x1, y1, x2, y2]
     Returns:
         IoU matrix of shape (N, M)
     """
@@ -21,17 +21,8 @@ def calculate_iou(boxes1, boxes2):
     if boxes1.device != boxes2.device:
         boxes2 = boxes2.to(boxes1.device)
     
-    # Convert to [x1, y1, x2, y2] format
-    def to_corners(boxes):
-        x_center, y_center, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
-        x1 = x_center - w / 2
-        y1 = y_center - h / 2
-        x2 = x_center + w / 2
-        y2 = y_center + h / 2
-        return torch.stack([x1, y1, x2, y2], dim=1)
-    
-    boxes1_corners = to_corners(boxes1)
-    boxes2_corners = to_corners(boxes2)
+    boxes1_corners = boxes1
+    boxes2_corners = boxes2
     
     # Calculate intersection
     x1_max = torch.max(boxes1_corners[:, 0:1], boxes2_corners[:, 0].unsqueeze(0))

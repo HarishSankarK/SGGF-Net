@@ -327,11 +327,7 @@ class HITUAVDataset(Dataset):
                     y1 = bbox.get('y1', 0)
                     x2 = bbox.get('x2', 0)
                     y2 = bbox.get('y2', 0)
-                    w = x2 - x1
-                    h = y2 - y1
-                    x_center = x1 + w / 2.0
-                    y_center = y1 + h / 2.0
-                    boxes.append([x_center, y_center, w, h])
+                    boxes.append([x1, y1, x2, y2])
                     labels.append(mapped)
         
         # Try XML format (PASCAL VOC style)
@@ -351,11 +347,7 @@ class HITUAVDataset(Dataset):
                     y1 = float(bbox.find('ymin').text)
                     x2 = float(bbox.find('xmax').text)
                     y2 = float(bbox.find('ymax').text)
-                    w = x2 - x1
-                    h = y2 - y1
-                    x_center = x1 + w / 2.0
-                    y_center = y1 + h / 2.0
-                    boxes.append([x_center, y_center, w, h])
+                    boxes.append([x1, y1, x2, y2])
                     labels.append(mapped)
             except:
                 pass
@@ -384,9 +376,13 @@ class HITUAVDataset(Dataset):
                             y_center = y_center_norm * img_h
                             w = w_norm * img_w
                             h = h_norm * img_h
+                            x1 = x_center - w / 2.0
+                            y1 = y_center - h / 2.0
+                            x2 = x_center + w / 2.0
+                            y2 = y_center + h / 2.0
                             mapped = self.remap_class(class_id, self.use_person_vehicle)
                             if mapped is not None:
-                                boxes.append([x_center, y_center, w, h])
+                                boxes.append([x1, y1, x2, y2])
                                 labels.append(mapped)
                         except Exception:
                             pass
