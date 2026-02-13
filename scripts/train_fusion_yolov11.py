@@ -273,6 +273,8 @@ def validate(model, dataloader, device, epoch, num_classes, conf_threshold=0.1, 
     all_targets = []
     total_detections = 0
     total_images = 0
+    pred_label_hist = torch.zeros(num_classes, dtype=torch.long)
+    gt_label_hist = torch.zeros(num_classes, dtype=torch.long)
     
     progress_bar = tqdm(dataloader, desc=f'Epoch {epoch+1} [Val]')
     
@@ -310,6 +312,16 @@ def validate(model, dataloader, device, epoch, num_classes, conf_threshold=0.1, 
             all_targets.extend(targets)
             total_detections += sum(int(p['boxes'].shape[0]) for p in predictions)
             total_images += len(predictions)
+            for p in predictions:
+                if p['labels'].numel() > 0:
+                    pred_label_hist += torch.bincount(
+                        p['labels'].detach().cpu(), minlength=num_classes
+                    )[:num_classes]
+            for t in targets:
+                if t['labels'].numel() > 0:
+                    gt_label_hist += torch.bincount(
+                        t['labels'].detach().cpu(), minlength=num_classes
+                    )[:num_classes]
     
     # Compute metrics
     from utils.metrics import calculate_map, calculate_ap50
@@ -335,7 +347,7 @@ def validate(model, dataloader, device, epoch, num_classes, conf_threshold=0.1, 
     ap50_score = calculate_ap50(formatted_predictions, formatted_targets, num_classes)
     
     avg_detections = (total_detections / max(total_images, 1))
-    return map_score, ap50_score, avg_detections
+    return map_score, ap50_score, avg_detections, pred_label_hist, gt_label_hist
 
 
 def main():
@@ -743,7 +755,7 @@ def main():
         )
         
         # Validate
-        val_map, val_ap50, avg_dets = validate(
+        val_map, val_ap50, avg_dets, pred_hist, gt_hist = validate(
             model, val_loader, device, epoch, args.num_classes,
             conf_threshold=args.val_conf_threshold, nms_threshold=args.val_nms_threshold
         )
@@ -755,6 +767,8 @@ def main():
         print(f'  Train Loss: {train_loss:.4f}')
         print(f'  Val mAP: {val_map:.4f}, Val AP50: {val_ap50:.4f}')
         print(f'  Val avg detections/image @conf={args.val_conf_threshold}: {avg_dets:.2f}')
+        print(f'  Val pred label hist: {pred_hist.tolist()}')
+        print(f'  Val gt label hist:   {gt_hist.tolist()}')
         
         # Save checkpoint
         checkpoint = {
