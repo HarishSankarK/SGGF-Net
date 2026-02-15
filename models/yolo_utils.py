@@ -128,10 +128,13 @@ def compute_iou(boxes1, boxes2, chunk_size=8192):
         inter_x2 = torch.min(boxes1_exp[..., 2], boxes2_exp[..., 2])
         inter_y2 = torch.min(boxes1_exp[..., 3], boxes2_exp[..., 3])
         inter_area = torch.clamp(inter_x2 - inter_x1, min=0) * torch.clamp(inter_y2 - inter_y1, min=0)
-        area1 = (boxes1_corners[:, 2] - boxes1_corners[:, 0]) * (boxes1_corners[:, 3] - boxes1_corners[:, 1])
-        area2 = (boxes2_corners[:, 2] - boxes2_corners[:, 0]) * (boxes2_corners[:, 3] - boxes2_corners[:, 1])
+        area1 = torch.clamp(boxes1_corners[:, 2] - boxes1_corners[:, 0], min=0) * \
+                torch.clamp(boxes1_corners[:, 3] - boxes1_corners[:, 1], min=0)
+        area2 = torch.clamp(boxes2_corners[:, 2] - boxes2_corners[:, 0], min=0) * \
+                torch.clamp(boxes2_corners[:, 3] - boxes2_corners[:, 1], min=0)
         union_area = area1.unsqueeze(1) + area2.unsqueeze(0) - inter_area
-        return inter_area / (union_area + 1e-7)
+        union_area = torch.clamp(union_area, min=1e-7)
+        return inter_area / union_area
     
     iou_list = []
     for i in range(0, N, chunk_size):
@@ -184,6 +187,27 @@ def assign_targets_to_predictions(predictions_list, grid_points_list, strides, t
             target = targets[b]
             gt_boxes = target['boxes']  # (M, 4) in [x1, y1, x2, y2]
             gt_labels = target['labels']  # (M,)
+
+            # Sanitize GT boxes: enforce proper corner ordering and finite values.
+            if len(gt_boxes) > 0:
+                x1 = torch.min(gt_boxes[:, 0], gt_boxes[:, 2])
+                y1 = torch.min(gt_boxes[:, 1], gt_boxes[:, 3])
+                x2 = torch.max(gt_boxes[:, 0], gt_boxes[:, 2])
+                y2 = torch.max(gt_boxes[:, 1], gt_boxes[:, 3])
+                gt_boxes = torch.stack([x1, y1, x2, y2], dim=1)
+
+                if image_size is not None and len(image_size) == 2:
+                    img_h, img_w = image_size
+                    gt_boxes[:, 0] = gt_boxes[:, 0].clamp(0, img_w)
+                    gt_boxes[:, 2] = gt_boxes[:, 2].clamp(0, img_w)
+                    gt_boxes[:, 1] = gt_boxes[:, 1].clamp(0, img_h)
+                    gt_boxes[:, 3] = gt_boxes[:, 3].clamp(0, img_h)
+
+                gt_w = gt_boxes[:, 2] - gt_boxes[:, 0]
+                gt_h = gt_boxes[:, 3] - gt_boxes[:, 1]
+                valid_mask = torch.isfinite(gt_boxes).all(dim=1) & (gt_w > 1e-4) & (gt_h > 1e-4)
+                gt_boxes = gt_boxes[valid_mask]
+                gt_labels = gt_labels[valid_mask]
             if len(gt_boxes) > max_gt_boxes:
                 perm = torch.randperm(len(gt_boxes), device=gt_boxes.device)[:max_gt_boxes]
                 gt_boxes = gt_boxes[perm]
@@ -203,6 +227,7 @@ def assign_targets_to_predictions(predictions_list, grid_points_list, strides, t
             # Compute IoU between predictions and GT
             pred_boxes_flat = decoded_boxes_flat[b]  # (H*W, 4)
             iou_matrix = compute_iou(pred_boxes_flat, gt_boxes_center)  # (H*W, M)
+            iou_matrix = torch.nan_to_num(iou_matrix, nan=0.0, posinf=0.0, neginf=0.0)
             
             # Find best GT match for each prediction
             max_iou, matched_gt_idx = iou_matrix.max(dim=1)  # (H*W,)
