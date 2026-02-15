@@ -266,11 +266,15 @@ def freeze_for_stage(model, stage):
         print('✓ Stage 3: Full fine-tuning (all layers)')
 
 
-def validate(model, dataloader, device, epoch, num_classes):
+def validate(model, dataloader, device, epoch, num_classes, conf_threshold=0.1, nms_threshold=0.5):
     """Validate model"""
     model.eval()
     all_predictions = []
     all_targets = []
+    total_detections = 0
+    total_images = 0
+    pred_label_hist = torch.zeros(num_classes, dtype=torch.long)
+    gt_label_hist = torch.zeros(num_classes, dtype=torch.long)
     
     progress_bar = tqdm(dataloader, desc=f'Epoch {epoch+1} [Val]')
     
@@ -283,8 +287,12 @@ def validate(model, dataloader, device, epoch, num_classes):
                 thermal_images = [img.to(device, non_blocking=True) for img in thermal_images]
                 
                 # Get predictions with post-processing
-                predictions = model.predict(rgb_images, thermal_images, 
-                                           conf_threshold=0.5, nms_threshold=0.5)
+                predictions = model.predict(
+                    rgb_images,
+                    thermal_images,
+                    conf_threshold=conf_threshold,
+                    nms_threshold=nms_threshold
+                )
             else:
                 # Single modality
                 images, targets = batch_data
@@ -292,12 +300,28 @@ def validate(model, dataloader, device, epoch, num_classes):
                 thermal_images = images
                 
                 # Get predictions with post-processing
-                predictions = model.predict(images, thermal_images,
-                                           conf_threshold=0.5, nms_threshold=0.5)
+                predictions = model.predict(
+                    images,
+                    thermal_images,
+                    conf_threshold=conf_threshold,
+                    nms_threshold=nms_threshold
+                )
             
             # Store predictions and targets
             all_predictions.extend(predictions)
             all_targets.extend(targets)
+            total_detections += sum(int(p['boxes'].shape[0]) for p in predictions)
+            total_images += len(predictions)
+            for p in predictions:
+                if p['labels'].numel() > 0:
+                    pred_label_hist += torch.bincount(
+                        p['labels'].detach().cpu(), minlength=num_classes
+                    )[:num_classes]
+            for t in targets:
+                if t['labels'].numel() > 0:
+                    gt_label_hist += torch.bincount(
+                        t['labels'].detach().cpu(), minlength=num_classes
+                    )[:num_classes]
     
     # Compute metrics
     from utils.metrics import calculate_map, calculate_ap50
@@ -322,7 +346,8 @@ def validate(model, dataloader, device, epoch, num_classes):
     map_score = calculate_map(formatted_predictions, formatted_targets, num_classes)
     ap50_score = calculate_ap50(formatted_predictions, formatted_targets, num_classes)
     
-    return map_score, ap50_score
+    avg_detections = (total_detections / max(total_images, 1))
+    return map_score, ap50_score, avg_detections, pred_label_hist, gt_label_hist
 
 
 def main():
@@ -376,6 +401,10 @@ def main():
                        help='Stage-by-stage training (faster): 1=backbone+fusion+head, 2=GFEM only, 3=full fine-tune. Use --resume to chain stages.')
     parser.add_argument('--max_size', type=int, default=640,
                        help='Max image size for resize (default 640 for Colab T4, use 1024/1536 if GPU has more memory)')
+    parser.add_argument('--val_conf_threshold', type=float, default=0.1,
+                       help='Validation confidence threshold (lower for early training diagnostics)')
+    parser.add_argument('--val_nms_threshold', type=float, default=0.5,
+                       help='Validation NMS IoU threshold')
     
     args = parser.parse_args()
     
@@ -726,7 +755,15 @@ def main():
         )
         
         # Validate
-        val_map, val_ap50 = validate(model, val_loader, device, epoch, args.num_classes)
+        val_map, val_ap50, avg_dets, pred_hist, gt_hist = validate(
+            model,
+            val_loader,
+            device,
+            epoch,
+            args.num_classes,
+            conf_threshold=args.val_conf_threshold,
+            nms_threshold=args.val_nms_threshold
+        )
         
         # Update learning rate
         scheduler.step()
@@ -734,6 +771,9 @@ def main():
         print(f'Epoch {epoch+1}/{args.epochs}:')
         print(f'  Train Loss: {train_loss:.4f}')
         print(f'  Val mAP: {val_map:.4f}, Val AP50: {val_ap50:.4f}')
+        print(f'  Val avg detections/image @conf={args.val_conf_threshold}: {avg_dets:.2f}')
+        print(f'  Val pred label hist: {pred_hist.tolist()}')
+        print(f'  Val gt label hist:   {gt_hist.tolist()}')
         
         # Save checkpoint
         checkpoint = {

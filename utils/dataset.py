@@ -715,8 +715,21 @@ class DroneRGBTDataset(Dataset):
         }
         
         if self.transform:
-            # Apply transform to both images (they should be transformed together)
-            rgb_image, target = self.transform(rgb_image, target)
-            thermal_image, _ = self.transform(thermal_image, target)
+            # Apply identical stochastic transforms to both modalities.
+            # Keep target consistent and avoid mutating it twice with different randomness.
+            orig_target = {
+                'boxes': target['boxes'].clone(),
+                'labels': target['labels'].clone()
+            }
+            rng_state = torch.get_rng_state()
+            rgb_image, target = self.transform(rgb_image, {
+                'boxes': orig_target['boxes'].clone(),
+                'labels': orig_target['labels'].clone()
+            })
+            torch.set_rng_state(rng_state)
+            thermal_image, _ = self.transform(thermal_image, {
+                'boxes': orig_target['boxes'].clone(),
+                'labels': orig_target['labels'].clone()
+            })
         
         return (rgb_image, thermal_image), target
