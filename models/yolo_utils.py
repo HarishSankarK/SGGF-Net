@@ -367,7 +367,8 @@ def post_process_predictions(predictions, grid_points_list, strides, conf_thresh
             final_scores = []
             final_labels = []
             
-            for cls_id in range(num_classes):
+            # Skip background class (0) in final detections.
+            for cls_id in range(1, num_classes):
                 cls_mask = all_labels == cls_id
                 if not cls_mask.any():
                     continue
