@@ -36,13 +36,9 @@ class RandomHorizontalFlip:
             image = F.hflip(image)
             if 'boxes' in target and target['boxes'].numel() > 0:
                 boxes = target['boxes'].clone()
-                # Boxes are in corner format [x1, y1, x2, y2].
-                # Horizontal flip swaps left/right around image width.
+                # Flip x coordinates: x_center -> width - x_center
                 width = image.shape[2]
-                x1 = boxes[:, 0].clone()
-                x2 = boxes[:, 2].clone()
-                boxes[:, 0] = width - x2
-                boxes[:, 2] = width - x1
+                boxes[:, 0] = width - boxes[:, 0]
                 target['boxes'] = boxes
         return image, target
 
@@ -75,10 +71,10 @@ class Resize:
         # Scale boxes
         if 'boxes' in target and target['boxes'].numel() > 0:
             boxes = target['boxes'].clone()
-            boxes[:, 0] *= scale  # x1
-            boxes[:, 1] *= scale  # y1
-            boxes[:, 2] *= scale  # x2
-            boxes[:, 3] *= scale  # y2
+            boxes[:, 0] *= scale  # x_center
+            boxes[:, 1] *= scale  # y_center
+            boxes[:, 2] *= scale  # width
+            boxes[:, 3] *= scale  # height
             target['boxes'] = boxes
         
         return image, target
@@ -123,3 +119,4 @@ def get_val_transform(max_size=640):
         Resize(max_size=max_size),
         Pad(size=(max_size, max_size), fill=0)
     ])
+

@@ -118,17 +118,17 @@ def evaluate(model, dataloader, device, num_classes, conf_threshold=0.5, nms_thr
     formatted_targets = []
     for target in all_targets:
         formatted_targets.append({
-            'boxes': target['boxes'].cpu(),
-            'labels': target['labels'].cpu()
+            'boxes': target['boxes'].cpu().numpy(),
+            'labels': target['labels'].cpu().numpy()
         })
     
     # Convert predictions to standard format
     formatted_predictions = []
     for pred in all_predictions:
         formatted_predictions.append({
-            'boxes': pred['boxes'].cpu(),
-            'scores': pred['scores'].cpu(),
-            'labels': pred['labels'].cpu()
+            'boxes': pred['boxes'].cpu().numpy(),
+            'scores': pred['scores'].cpu().numpy(),
+            'labels': pred['labels'].cpu().numpy()
         })
     
     # Compute mAP (requires num_classes parameter)
