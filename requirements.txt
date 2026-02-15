@@ -1,10 +1,11 @@
-torch>=1.12.0
-torchvision>=0.13.0
-# torch_xla[tpu]>=2.0.0  # Only needed for Google Cloud TPU training, not available on macOS
+# Fusion-YOLOv11 / SGGF-Net - Dependencies
+# For GPU (Colab/CUDA): install PyTorch first:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+
+torch>=2.0.0
+torchvision>=0.15.0
 numpy>=1.21.0
 Pillow>=9.0.0
-opencv-python>=4.5.0
 tqdm>=4.62.0
 matplotlib>=3.5.0
-scipy>=1.7.0
-
+opencv-python>=4.5.0

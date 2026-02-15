@@ -1,194 +1,258 @@
-# SGGF-Net: UAV Image Object Detection
+# SGGF-Net / Fusion-YOLOv11: Multimodal UAV Object Detection
 
-**UAV Image Object Detection based on Self-Attention Guidance and Global Feature Fusion**
+**RGB-Thermal object detection for UAV/drone imagery** — Dual-stream SGGF-Net backbone with mid-level fusion and YOLOv11 detection head.
 
-Implementation of SGGF-Net for detecting objects in UAV (drone) images, optimized for training on Apple Silicon (M1/M2) in ~60 minutes.
+- **Fusion-YOLOv11**: Primary implementation — trains on DroneRGBT (RGB-Thermal), SMOD (RGB), and HIT-UAV (thermal). Classes: **person**, **vehicle**.
+- **SGGF-Net**: Original single-modality Faster R-CNN variant (see `scripts/train.py`).
+
+---
 
 ## Quick Start
 
-### Option 1: Google Colab (Recommended - T4 GPU, ~35-45 min)
+### Option 1: Google Colab (Recommended)
 
-1. **Open the Colab notebook**: `SGGF_Net_Training_Colab.ipynb`
-2. **Enable GPU**: Runtime → Change runtime type → GPU (T4)
-3. **Run all cells**: They will automatically mount Drive, clone repo, install dependencies
-4. **Checkpoints saved to Google Drive**: `/content/drive/MyDrive/SGGF-Net-checkpoints/`
-
-**Total training time: ~35-45 minutes on T4 GPU**
-
-### Option 2: Local M1 (CPU only - ~2-3 hours)
-
-⚠ **Note**: MPS (Apple GPU) crashes due to memory issues. CPU is stable but slow.
-
-### 1. Setup Environment
+1. Open **`FusionYOLOv11_Colab.ipynb`** (in project root)
+2. Enable GPU: Runtime → Change runtime type → T4 GPU
+3. Run all cells: mount Drive, install deps, clone repo, train
+4. Checkpoints save to: `/content/drive/MyDrive/FusionYOLOv11-checkpoints/`
 
 ```bash
-# Install dependencies
-pip install torch torchvision numpy pillow opencv-python tqdm matplotlib scipy
+# Training command (Colab cell)
+!python3 scripts/train_fusion_yolov11.py \
+  --dataset combined_all \
+  --hituav_dir data/hit-uav \
+  --dronergbt_dir data/DroneRGBT \
+  --smod_dir data/SMOD \
+  --checkpoint_dir /content/drive/MyDrive/FusionYOLOv11-checkpoints \
+  --stage 1 --max_size 640 --batch_size 8 --num_workers 2
 ```
 
-### 2. Prepare Dataset
-
-Ensure HIT-UAV dataset is in `data/hit-uav/` with structure:
-```
-data/hit-uav/
-├── images/
-│   ├── train/
-│   ├── val/
-│   └── test/
-└── labels/
-    ├── train/
-    ├── val/
-    └── test/
-```
-
-### 3. Run 3-Stage Training
-
-**Stage 1: Baseline (20-25 min)**
-```bash
-python scripts/train.py --stage 1 --data_dir data/hit-uav --num_classes 6
-```
-
-**Stage 2: Enable GFEM (20 min)**
-```bash
-python scripts/train.py --stage 2 --data_dir data/hit-uav --num_classes 6 \
-    --resume checkpoints/stage1_best.pth
-```
-
-**Stage 3: Enable NDPA+ARPM (15 min)**
-```bash
-python scripts/train.py --stage 3 --data_dir data/hit-uav --num_classes 6 \
-    --resume checkpoints/stage2_best.pth
-```
-
-**Or use the notebook:**
-```bash
-jupyter notebook SGGF_Net_Training.ipynb
-```
-
-### 4. Evaluate
+### Option 2: Laptop with NVIDIA GPU (4–8GB VRAM)
 
 ```bash
-python scripts/evaluate.py \
-    --dataset hituav \
-    --data_dir data/hit-uav \
-    --checkpoint checkpoints/stage3_best.pth \
-    --num_classes 6 \
-    --split test
+# Install PyTorch with CUDA: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+pip install -r requirements.txt
+
+# Laptop mode (4–6GB): batch=4, AMP, max_size=640
+python scripts/train_fusion_yolov11.py --dataset combined_all --laptop \
+  --hituav_dir data/hit-uav --dronergbt_dir data/DroneRGBT --smod_dir data/SMOD \
+  --checkpoint_dir checkpoints --stage 1
+
+# 8GB+ GPU: omit --laptop (defaults: batch=8, max_size=640)
 ```
 
-## Training Strategy (Optimized for M1)
+### Option 3: Single Dataset
 
-### Optimizations Applied
+```bash
+# DroneRGBT only (RGB-Thermal, person)
+python scripts/train_fusion_yolov11.py --dataset dronergbt --data_dir data/DroneRGBT --stage 1
 
-1. **Transfer Learning**: Frozen ResNet early layers (layer0, layer1, layer2)
-2. **Dataset Subset**: 35% of training data (for research purposes)
-3. **Reduced Resolution**: 640×640 (instead of 1536×1536)
-4. **Mixed Precision**: FP16 on MPS
-5. **Reduced Proposals**: 300 RPN proposals (instead of 1000)
-6. **Staged Training**: Progressive enablement of components
+# SMOD only (RGB, person+vehicle)
+python scripts/train_fusion_yolov11.py --dataset smod --data_dir data/SMOD --stage 1
 
-### Training Stages
+# HIT-UAV only (thermal/infrared, person+vehicle)
+python scripts/train_fusion_yolov11.py --dataset hituav --data_dir data/hit-uav --stage 1
+```
 
-**Stage 1: Baseline Faster-RCNN (8 epochs, ~20-25 min)**
-- Train: Backbone (layer3, layer4) + FPN + RPN + ROI Head
-- Frozen: GFEM, NDPA, ARPM, ResNet early layers
-- Purpose: Stable anchor learning
+---
 
-**Stage 2: Enable GFEM (6 epochs, ~20 min)**
-- Train: GFEM module only
-- Frozen: Everything else
-- Purpose: Learn global feature extraction
+## Datasets
 
-**Stage 3: Enable NDPA+ARPM (4 epochs, ~15 min)**
-- Train: NDPA and ARPM modules
-- Frozen: Everything else
-- Purpose: Fine-tune attention modules
+### Supported Datasets
 
-**Total Time:**
-- **Colab T4 GPU**: ~35-45 minutes (recommended)
-- **Local M1 CPU**: ~2-3 hours (stable but slow)
-- **Local M1 MPS**: Crashes (not usable)
+| Dataset     | Modality      | Classes    | Structure                |
+|------------|---------------|------------|--------------------------|
+| **DroneRGBT** | RGB + Thermal | person     | `rgb/train`, `thermal/train`, `labels/train` |
+| **SMOD**   | RGB           | person, vehicle | `images/train`, `labels/train` (YOLO format) |
+| **HIT-UAV** | Thermal/Infrared | person, vehicle | `images/train`, `labels/train` (YOLO format) |
+
+### Class Mapping (Unified 2-Class System)
+
+- **Person** → class 1
+- **Vehicle** (Car, Bicycle, OtherVehicle) → class 2  
+- **DontCare** → skipped
+
+### Directory Layout
+
+```
+data/
+├── hit-uav/           # HIT-UAV (thermal)
+│   ├── images/train, val
+│   └── labels/train, val
+├── DroneRGBT/         # RGB-Thermal pairs
+│   ├── rgb/train, val
+│   ├── thermal/train, val
+│   └── labels/train, val
+└── SMOD/              # RGB
+    ├── images/train, val
+    └── labels/train, val
+```
+
+### Preprocessing
+
+**HIT-UAV** (raw JSON/XML from [HIT-UAV-Infrared-Thermal-Dataset](https://github.com/suojiashun/HIT-UAV-Infrared-Thermal-Dataset)):
+
+```bash
+python scripts/preprocess_hituav.py --source data/HIT-UAV-raw --target data/hit-uav
+```
+
+**DroneRGBT** (point annotations → YOLO boxes):
+
+```bash
+python scripts/preprocess_dronergbt.py --source data/DroneRGBT-raw --target data/DroneRGBT
+```
+
+---
+
+## Training
+
+### Script: `train_fusion_yolov11.py`
+
+### Dataset Modes
+
+| Mode           | Datasets                        | Default Ratios          |
+|----------------|----------------------------------|-------------------------|
+| `combined`     | DroneRGBT + SMOD                | 100% each               |
+| `combined_all` | HIT-UAV + DroneRGBT + SMOD      | 100% HIT, 50% DroneRGBT, 25% SMOD |
+
+Override ratios: `--dronergbt_subset_ratio 0.5 --smod_subset_ratio 0.25`
+
+### Stage-by-Stage Training (Recommended)
+
+| Stage | Trainable                                      | Frozen                   | Epochs | LR    |
+|-------|------------------------------------------------|--------------------------|--------|-------|
+| 1     | Backbone (layer3,4) + Fusion + PANet + Head    | GFEM, backbone layer0–2  | 30     | 5e-5  |
+| 2     | GFEM only                                      | Rest                     | 20     | 1e-5  |
+| 3     | Full fine-tune                                 | None                     | 30     | 5e-6  |
+
+Chain stages:
+
+```bash
+# Stage 1
+python scripts/train_fusion_yolov11.py --dataset combined_all --stage 1 \
+  --hituav_dir data/hit-uav --dronergbt_dir data/DroneRGBT --smod_dir data/SMOD
+
+# Stage 2
+python scripts/train_fusion_yolov11.py --stage 2 --resume checkpoints/best.pth \
+  --dataset combined_all --hituav_dir data/hit-uav --dronergbt_dir data/DroneRGBT --smod_dir data/SMOD
+
+# Stage 3
+python scripts/train_fusion_yolov11.py --stage 3 --resume checkpoints/best.pth \
+  --dataset combined_all --hituav_dir data/hit-uav --dronergbt_dir data/DroneRGBT --smod_dir data/SMOD
+```
+
+### Key Arguments
+
+| Argument              | Default | Description                          |
+|-----------------------|---------|--------------------------------------|
+| `--dataset`           | dronergbt | dronergbt, hituav, smod, combined, combined_all |
+| `--stage`             | None    | 1, 2, 3 for stage-wise training      |
+| `--batch_size`        | 8       | Reduce for low VRAM                 |
+| `--max_size`          | 640     | Image resize max (Colab: 640)        |
+| `--laptop`            | -       | batch=4, num_workers=2, use_amp      |
+| `--use_amp`           | -       | Mixed precision (FP16)              |
+| `--val_conf_threshold`| 0.25    | Lower (e.g. 0.05) for early training |
+| `--resume`            | None    | Path or "latest"/"best"              |
+| `--auto_resume`       | -       | Resume from latest.pth if present   |
+
+---
+
+## Evaluation
+
+```bash
+python scripts/evaluate_fusion.py \
+  --dataset combined_all \
+  --hituav_dir data/hit-uav \
+  --dronergbt_dir data/DroneRGBT \
+  --smod_dir data/SMOD \
+  --checkpoint checkpoints/best.pth \
+  --num_classes 3 \
+  --split val
+```
+
+For low-VRAM GPUs: `--laptop` (batch=2, max_size=640)
+
+---
 
 ## Model Architecture
 
-### Components
+**Fusion-YOLOv11** pipeline:
 
-1. **GFEM (Global Feature Extraction Module)**
-   - Transformer-based self-attention
-   - Captures long-range dependencies
-   - Patch size: 32×32 (optimized)
+1. **Dual-stream backbone** — GFEM + ResNet50 per modality (RGB, Thermal)
+2. **Mid-level fusion** — Concat + cross-modal attention at C2–C5
+3. **PANet** — Multi-scale feature aggregation
+4. **YOLOv11 head** — Anchor-free detection (objectness + bbox + class logits)
 
-2. **NDPA (Normal Distribution-based Prior Assigner)**
-   - Models bounding boxes as 2D normal distributions
-   - Uses KL divergence for matching
-   - Improves small object detection
+Single-modality input (e.g. HIT-UAV, SMOD): RGB image duplicated as both RGB and thermal streams.
 
-3. **ARPM (Attention-guided ROI Pooling Module)**
-   - Multi-scale feature fusion
-   - Self-attention enhancement
-   - Optimizes ROI features
-
-## Configuration
-
-Default settings (M1 optimized):
-- **Device**: CPU (MPS disabled due to memory crashes - see note below)
-- **Batch size**: 1
-- **Image size**: 640×640
-- **Optimizer**: AdamW (lr=1e-4)
-- **Mixed precision**: Disabled (CPU/MPS limitations)
-- **Dataset subset**: 35% (for faster training)
-- **RPN proposals**: 300 (post-NMS)
-
-**⚠ Important: MPS (Apple Silicon GPU) Note:**
-- MPS is **disabled by default** due to memory allocation crashes (`IOGPUDeviceShmem` errors)
-- The model is too complex for M1's GPU shared memory constraints
-- CPU training is slower (~2-3 hours) but **stable and reliable**
-- To force MPS (at your own risk): `USE_MPS=1 python scripts/train.py ...`
+---
 
 ## Evaluation Metrics
 
-- **mAP**: Mean Average Precision (IoU: 0.5:0.95)
-- **AP50**: Average Precision at IoU=0.5
-- **Precision, Recall, F1**: Standard detection metrics
+- **mAP** — Mean AP (IoU 0.5:0.95)
+- **AP50** — AP at IoU 0.5
+- **Precision, Recall, F1** — Via `evaluate_fusion.py`
 
-## Expected Results
-
-With the optimized training strategy:
-- Training completes in ~60 minutes on M1
-- mAP will be lower than full training but pipeline is validated
-- For research: "Results obtained under hardware constraints (Apple M1)"
+---
 
 ## Project Structure
 
 ```
 sggf_net/
-├── models/              # Model architectures
-│   ├── gfem.py         # Global Feature Extraction Module
-│   ├── ndpa.py         # Normal Distribution-based Prior Assigner
-│   ├── arpm.py         # Attention-guided ROI Pooling Module
-│   └── sggf_net.py     # Main SGGF-Net architecture
-├── utils/               # Utility functions
-│   ├── dataset.py      # Dataset loaders
-│   ├── transforms.py   # Data augmentation
-│   └── metrics.py      # Evaluation metrics
-├── scripts/            # Training and evaluation scripts
-│   ├── train.py        # Staged training script
-│   └── evaluate.py     # Evaluation script
-├── checkpoints/        # Saved model checkpoints
-├── SGGF_Net_Training.ipynb  # Training notebook
-└── requirements.txt    # Python dependencies
+├── models/
+│   ├── fusion_yolov11.py    # Fusion-YOLOv11 (main model)
+│   ├── yolo_head.py        # YOLOv11 head + loss
+│   ├── yolo_utils.py       # decode_bbox, post_process, assign_targets
+│   ├── gfem.py             # Global Feature Extraction Module
+│   ├── fusion.py           # MidLevelFusion
+│   ├── panet.py            # PANet
+│   ├── sggf_net.py         # ResNet backbone, legacy SGGF-Net
+│   └── ...
+├── utils/
+│   ├── dataset.py          # DroneRGBTDataset, HITUAVDataset, SMODDataset
+│   ├── transforms.py       # Resize, Pad, RandomHorizontalFlip
+│   └── metrics.py          # mAP, AP50, IoU
+├── scripts/
+│   ├── train_fusion_yolov11.py   # Main training (Fusion-YOLOv11)
+│   ├── evaluate_fusion.py        # Evaluation
+│   ├── preprocess_hituav.py      # HIT-UAV preprocessing
+│   ├── preprocess_dronergbt.py   # DroneRGBT preprocessing
+│   ├── preprocess_smod.py       # SMOD preprocessing
+│   ├── train.py                  # Legacy SGGF-Net (HIT-UAV)
+│   └── evaluate.py               # Legacy evaluation
+├── data/                   # Datasets (hit-uav, DroneRGBT, SMOD)
+├── requirements.txt
+└── README.md
 ```
+
+---
 
 ## Hardware Requirements
 
-- **Recommended**: Apple Silicon (M1/M2) on **CPU mode** (stable)
-- **Note**: MPS (GPU) is disabled by default due to memory crashes on M1
-- **Alternative**: CUDA GPU (if available, faster)
-- **RAM**: 8GB+ recommended
-- **Storage**: ~5GB for dataset + checkpoints
-- **Training Time**: ~2-3 hours on CPU (M1), ~1 hour on CUDA GPU
+| Platform              | Notes                                                     |
+|-----------------------|-----------------------------------------------------------|
+| **Colab T4**          | Recommended; max_size 640, batch 8 (~15–25 min/epoch)    |
+| **Laptop NVIDIA 4–6GB** | Use `--laptop` (batch 4, AMP)                          |
+| **Laptop NVIDIA 8GB+** | Defaults OK (batch 8)                                   |
+| **Apple M1/M2**       | Legacy `train.py` CPU only; MPS unstable for Fusion     |
+| **RAM**               | 8GB+                                                     |
+
+---
+
+## Requirements
+
+```bash
+pip install -r requirements.txt
+# For GPU: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+```
+
+From `requirements.txt`: torch, torchvision, numpy, Pillow, tqdm, matplotlib, opencv-python
+
+---
 
 ## Citation
+
+Original SGGF-Net:
 
 ```bibtex
 @article{bai2024uav,
@@ -200,3 +264,5 @@ sggf_net/
   year={2024}
 }
 ```
+
+Fusion-YOLOv11 extends this with RGB-Thermal dual-stream fusion and a YOLOv11 detection head.

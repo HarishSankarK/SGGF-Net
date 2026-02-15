@@ -188,8 +188,18 @@ def main():
                        help='Confidence threshold for detections')
     parser.add_argument('--nms_threshold', type=float, default=0.5,
                        help='NMS IoU threshold')
+    parser.add_argument('--max_size', type=int, default=640,
+                       help='Max image size (default 640 for laptop/Colab GPUs)')
+    parser.add_argument('--laptop', action='store_true',
+                       help='Laptop mode: batch_size=2, max_size=640')
     
     args = parser.parse_args()
+    
+    if args.laptop:
+        if '--batch_size' not in ' '.join(sys.argv):
+            args.batch_size = 2
+        if '--max_size' not in ' '.join(sys.argv):
+            args.max_size = 640
     
     # Device setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -209,7 +219,7 @@ def main():
             args.num_classes = 3  # HIT-UAV: person + vehicle
     
     # Load dataset
-    val_transform = get_val_transform()
+    val_transform = get_val_transform(max_size=args.max_size)
     
     if args.dataset == 'dronergbt':
         dataset = DroneRGBTDataset(
