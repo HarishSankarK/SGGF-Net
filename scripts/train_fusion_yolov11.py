@@ -152,12 +152,18 @@ def train_one_epoch(model, dataloader, optimizer, device, epoch, scaler=None, us
         total_loss += loss.item()
         num_batches += 1
         
-        # Update progress bar (less frequently for better performance)
+        # Update progress bar with loss components
         if batch_idx % 10 == 0 or batch_idx == len(dataloader) - 1:
-            progress_bar.set_postfix({
+            postfix = {
                 'loss': f'{loss.item():.4f}',
                 'avg_loss': f'{total_loss/num_batches:.4f}'
-            })
+            }
+            # Show loss breakdown on first batch of epoch
+            if batch_idx == 0:
+                for k, v in loss_dict.items():
+                    if isinstance(v, torch.Tensor):
+                        postfix[k] = f'{v.item():.4f}'
+            progress_bar.set_postfix(postfix)
     
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
     return avg_loss

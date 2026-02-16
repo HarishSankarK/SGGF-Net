@@ -70,13 +70,13 @@ class Resize:
         # Resize image
         image = F.resize(image, (new_h, new_w))
         
-        # Scale boxes
+        # Scale boxes (xyxy format: all coordinates scale uniformly)
         if 'boxes' in target and target['boxes'].numel() > 0:
             boxes = target['boxes'].clone()
-            boxes[:, 0] *= scale  # x_center
-            boxes[:, 1] *= scale  # y_center
-            boxes[:, 2] *= scale  # width
-            boxes[:, 3] *= scale  # height
+            boxes[:, 0] *= scale  # x1
+            boxes[:, 1] *= scale  # y1
+            boxes[:, 2] *= scale  # x2
+            boxes[:, 3] *= scale  # y2
             target['boxes'] = boxes
         
         return image, target

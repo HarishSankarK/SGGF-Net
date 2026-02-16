@@ -280,31 +280,31 @@ class YOLOv11Loss(nn.Module):
             
             # Bounding box loss (CIoU, only for positives)
             if pos_mask.any():
-                bbox_pred_pos = bbox_pred[pos_mask]  # (N_pos, 4)
-                bbox_targets_pos = bbox_targets[pos_mask]  # (N_pos, 4)
+                bbox_pred_pos = bbox_pred[pos_mask]  # (N_pos, 4) raw predictions
+                bbox_targets_pos = bbox_targets[pos_mask]  # (N_pos, 4) dx,dy,dw,dh targets
                 
-                # Decode current predictions
                 grid_points = grid_points_list[scale_idx]
                 stride = strides[scale_idx]
                 
                 # Get grid points for positive locations
                 pos_indices_2d = torch.where(pos_mask)
-                if len(pos_indices_2d) == 3:  # (B, H, W)
+                if len(pos_indices_2d) == 3:
                     pos_b, pos_y, pos_x = pos_indices_2d[0], pos_indices_2d[1], pos_indices_2d[2]
-                    # Get grid points for each positive location
                     pos_grid_points = grid_points[pos_y, pos_x]  # (N_pos, 2)
                 else:
-                    # Fallback: use all grid points (less efficient but safe)
                     pos_grid_points = grid_points.reshape(-1, 2)[pos_mask.reshape(-1)]
                 
-                # Decode predictions (individual positive samples)
-                decoded_pred = decode_bbox(bbox_pred_pos, pos_grid_points, stride)
+                # Decode predictions to absolute center format
+                decoded_pred = decode_bbox(bbox_pred_pos, pos_grid_points, stride)  # (N_pos, 4) cx,cy,w,h
                 
-                # Decode target boxes (apply deltas to current predictions)
-                from .anchor_utils import box_transform
-                decoded_target = box_transform(decoded_pred, bbox_targets_pos)
+                # Decode targets: targets are deltas relative to grid cell
+                # dx, dy are relative to stride; dw, dh are log-scale relative to stride
+                target_cx = pos_grid_points[:, 0] + bbox_targets_pos[:, 0] * stride
+                target_cy = pos_grid_points[:, 1] + bbox_targets_pos[:, 1] * stride
+                target_w = torch.exp(bbox_targets_pos[:, 2]) * stride
+                target_h = torch.exp(bbox_targets_pos[:, 3]) * stride
+                decoded_target = torch.stack([target_cx, target_cy, target_w, target_h], dim=1)
                 
-                # Compute CIoU loss
                 bbox_loss = self.ciou_loss(decoded_pred, decoded_target)
                 bbox_loss = bbox_loss.mean()
                 total_bbox_loss += bbox_loss
