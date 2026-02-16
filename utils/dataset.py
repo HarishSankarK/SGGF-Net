@@ -78,11 +78,8 @@ class VisDroneDataset(Dataset):
                         
                         # Filter out ignored regions (category 0)
                         if category > 0 and category < len(self.CLASSES):
-                            # Convert to center format: [x_center, y_center, width, height]
-                            x_center = x1 + w / 2.0
-                            y_center = y1 + h / 2.0
-                            
-                            boxes.append([x_center, y_center, w, h])
+                            x2, y2 = x1 + w, y1 + h
+                            boxes.append([x1, y1, x2, y2])
                             labels.append(category)
         
         boxes = torch.tensor(boxes, dtype=torch.float32) if boxes else torch.zeros((0, 4), dtype=torch.float32)
@@ -164,14 +161,7 @@ class AITODDataset(Dataset):
                     y1 = float(bbox.find('ymin').text)
                     x2 = float(bbox.find('xmax').text)
                     y2 = float(bbox.find('ymax').text)
-                    
-                    # Convert to center format
-                    w = x2 - x1
-                    h = y2 - y1
-                    x_center = x1 + w / 2.0
-                    y_center = y1 + h / 2.0
-                    
-                    boxes.append([x_center, y_center, w, h])
+                    boxes.append([x1, y1, x2, y2])
                     labels.append(label)
         
         boxes = torch.tensor(boxes, dtype=torch.float32) if boxes else torch.zeros((0, 4), dtype=torch.float32)
@@ -390,6 +380,14 @@ class HITUAVDataset(Dataset):
                                 labels.append(mapped)
                         except Exception:
                             pass
+        
+        # Convert [x_center, y_center, w, h] -> [x1, y1, x2, y2] for assign_targets and metrics
+        if boxes:
+            boxes_xyxy = []
+            for b in boxes:
+                cx, cy, w, h = b[0], b[1], b[2], b[3]
+                boxes_xyxy.append([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2])
+            boxes = boxes_xyxy
         
         boxes = torch.tensor(boxes, dtype=torch.float32) if boxes else torch.zeros((0, 4), dtype=torch.float32)
         labels = torch.tensor(labels, dtype=torch.int64) if labels else torch.zeros((0,), dtype=torch.int64)

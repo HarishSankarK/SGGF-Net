@@ -36,9 +36,11 @@ class RandomHorizontalFlip:
             image = F.hflip(image)
             if 'boxes' in target and target['boxes'].numel() > 0:
                 boxes = target['boxes'].clone()
-                # Flip x coordinates: x_center -> width - x_center
                 width = image.shape[2]
-                boxes[:, 0] = width - boxes[:, 0]
+                # Flip x coordinates for [x1, y1, x2, y2] format
+                x1_new = width - boxes[:, 2]
+                x2_new = width - boxes[:, 0]
+                boxes[:, 0], boxes[:, 2] = x1_new, x2_new
                 target['boxes'] = boxes
         return image, target
 
