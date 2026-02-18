@@ -190,6 +190,8 @@ def main():
                        help='Max image size (default 640 for laptop/Colab GPUs)')
     parser.add_argument('--laptop', action='store_true',
                        help='Laptop mode: batch_size=2, max_size=640')
+    parser.add_argument('--cpu', action='store_true',
+                       help='Force CPU (no GPU). Uses batch_size=1, num_workers=0, max_size=480 for speed.')
     
     args = parser.parse_args()
     
@@ -198,9 +200,14 @@ def main():
             args.batch_size = 2
         if '--max_size' not in ' '.join(sys.argv):
             args.max_size = 640
+    if args.cpu:
+        if '--batch_size' not in ' '.join(sys.argv):
+            args.batch_size = 1
+        if '--max_size' not in ' '.join(sys.argv):
+            args.max_size = 480
     
-    # Device setup
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Device setup (--cpu forces CPU even if CUDA is available)
+    device = torch.device('cpu' if args.cpu else ('cuda' if torch.cuda.is_available() else 'cpu'))
     print(f'Using device: {device}')
     
     # Set num_classes based on dataset if not explicitly provided
@@ -259,9 +266,13 @@ def main():
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
     
+    # CPU-friendly: no pin_memory, num_workers=0 to avoid multiprocessing overhead
+    use_cuda = device.type == 'cuda'
     dataloader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=False,
-        collate_fn=collate_fn, num_workers=2, pin_memory=True
+        collate_fn=collate_fn,
+        num_workers=2 if use_cuda else 0,
+        pin_memory=use_cuda
     )
     
     # Create model
