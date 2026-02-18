@@ -113,22 +113,20 @@ def evaluate(model, dataloader, device, num_classes, conf_threshold=0.5, nms_thr
             all_predictions.extend(predictions)
             all_targets.extend(targets)
     
-    # Compute metrics
-    # Convert targets to standard format
+    # Compute metrics (use tensors on CPU — metrics expect torch tensors)
     formatted_targets = []
     for target in all_targets:
         formatted_targets.append({
-            'boxes': target['boxes'].cpu().numpy(),
-            'labels': target['labels'].cpu().numpy()
+            'boxes': target['boxes'].cpu(),
+            'labels': target['labels'].cpu()
         })
     
-    # Convert predictions to standard format
     formatted_predictions = []
     for pred in all_predictions:
         formatted_predictions.append({
-            'boxes': pred['boxes'].cpu().numpy(),
-            'scores': pred['scores'].cpu().numpy(),
-            'labels': pred['labels'].cpu().numpy()
+            'boxes': pred['boxes'].cpu(),
+            'scores': pred['scores'].cpu(),
+            'labels': pred['labels'].cpu()
         })
     
     # Compute mAP (requires num_classes parameter)
@@ -273,15 +271,20 @@ def main():
         fusion_type='concat_attention'
     )
     
-    # Load checkpoint
-    checkpoint = torch.load(args.checkpoint, map_location=device)
-    if 'model_state_dict' in checkpoint:
+    # Load checkpoint (prefer EMA weights from single-pass training)
+    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    if 'ema_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['ema_state_dict'])
+        print("Loaded EMA weights from checkpoint")
+    elif 'model_state_dict' in checkpoint:
         model.load_state_dict(checkpoint['model_state_dict'])
-        print(f"Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
-        if 'best_map' in checkpoint:
-            print(f"Best mAP in checkpoint: {checkpoint['best_map']:.4f}")
+        print("Loaded model_state_dict from checkpoint")
     else:
         model.load_state_dict(checkpoint)
+    if isinstance(checkpoint, dict):
+        print(f"Checkpoint epoch: {checkpoint.get('epoch', 'unknown')}")
+        if 'best_map' in checkpoint:
+            print(f"Best mAP in checkpoint: {checkpoint['best_map']:.4f}")
     
     model = model.to(device)
     model.eval()
