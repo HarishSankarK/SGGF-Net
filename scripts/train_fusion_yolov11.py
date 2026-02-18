@@ -333,8 +333,8 @@ def freeze_for_stage(model, stage):
         print('✓ Stage 3: Full fine-tuning (all layers)')
 
 
-def validate(model, dataloader, device, epoch, num_classes, conf_threshold=0.25):
-    """Validate model. Uses lower conf_threshold (0.25) to capture more detections early in training."""
+def validate(model, dataloader, device, epoch, num_classes, conf_threshold=0.01):
+    """Validate model. Uses low conf_threshold (0.01) to capture detections even in early training."""
     model.eval()
     all_predictions = []
     all_targets = []
@@ -385,7 +385,33 @@ def validate(model, dataloader, device, epoch, num_classes, conf_threshold=0.25)
             'labels': pred['labels'].cpu()
         })
     
-    # Compute mAP (requires num_classes parameter)
+    # Diagnostics: show detection stats so we can tell if predictions exist
+    total_preds = sum(len(p['boxes']) for p in formatted_predictions)
+    total_gt = sum(len(t['boxes']) for t in formatted_targets)
+    avg_preds = total_preds / max(len(formatted_predictions), 1)
+    
+    # Label distribution
+    all_pred_labels = torch.cat([p['labels'] for p in formatted_predictions if len(p['labels']) > 0]) if total_preds > 0 else torch.tensor([])
+    all_gt_labels = torch.cat([t['labels'] for t in formatted_targets if len(t['labels']) > 0]) if total_gt > 0 else torch.tensor([])
+    pred_hist = [0] * num_classes
+    gt_hist = [0] * num_classes
+    for l in all_pred_labels.tolist():
+        if 0 <= int(l) < num_classes:
+            pred_hist[int(l)] += 1
+    for l in all_gt_labels.tolist():
+        if 0 <= int(l) < num_classes:
+            gt_hist[int(l)] += 1
+    
+    # Score distribution
+    if total_preds > 0:
+        all_scores = torch.cat([p['scores'] for p in formatted_predictions])
+        print(f'  Val detections: {total_preds} total ({avg_preds:.1f}/img) @conf>{conf_threshold}')
+        print(f'  Val score stats: min={all_scores.min():.4f}, max={all_scores.max():.4f}, mean={all_scores.mean():.4f}')
+    else:
+        print(f'  Val detections: 0 (no predictions above conf={conf_threshold})')
+    print(f'  Val pred labels: {pred_hist}, GT labels: {gt_hist}')
+    
+    # Compute mAP
     map_score = calculate_map(formatted_predictions, formatted_targets, num_classes)
     ap50_score = calculate_ap50(formatted_predictions, formatted_targets, num_classes)
     
@@ -445,8 +471,8 @@ def main():
                        help='Single-pass training (recommended): differential LR + OneCycleLR + EMA. No stages needed.')
     parser.add_argument('--max_size', type=int, default=640,
                        help='Max image size for resize (default 640 for Colab T4, use 1024/1536 if GPU has more memory)')
-    parser.add_argument('--val_conf_threshold', type=float, default=0.25,
-                       help='Confidence threshold for validation mAP (default 0.25, use 0.05–0.1 for early training)')
+    parser.add_argument('--val_conf_threshold', type=float, default=0.01,
+                       help='Confidence threshold for validation mAP (default 0.01 to capture early-training detections)')
     parser.add_argument('--laptop', action='store_true',
                        help='Laptop mode: batch_size=4, num_workers=2, use_amp=True for 4-6GB GPUs')
     
