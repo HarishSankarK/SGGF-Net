@@ -176,17 +176,22 @@ def train_one_epoch(model, dataloader, optimizer, device, epoch, scaler=None, us
 
 class ModelEMA:
     """Exponential Moving Average of model weights for better generalization.
-    Keeps a shadow copy of weights that averages over training steps."""
+    Uses warmup decay: starts low (~0.1) and ramps up to target decay over training."""
     
     def __init__(self, model, decay=0.9999):
         self.ema = {k: v.clone().detach() for k, v in model.state_dict().items()}
         self.decay = decay
+        self.num_updates = 0
     
     def update(self, model):
+        self.num_updates += 1
+        # Warmup: decay ramps from ~0.1 to target over first ~2000 steps
+        # At step 0: decay ≈ 0.09, step 100: 0.91, step 1000: 0.99, step 10000: 0.999
+        d = min(self.decay, (1 + self.num_updates) / (10 + self.num_updates))
         with torch.no_grad():
             for k, v in model.state_dict().items():
                 if v.is_floating_point():
-                    self.ema[k].mul_(self.decay).add_(v, alpha=1 - self.decay)
+                    self.ema[k].mul_(d).add_(v, alpha=1 - d)
                 else:
                     self.ema[k].copy_(v)
     
