@@ -513,19 +513,23 @@ def main():
         )
         collate_fn = collate_fn_paired
     elif args.dataset == 'hituav':
+        hituav_root = args.hituav_dir
+        print(f"Loading HIT-UAV dataset from: {hituav_root}")
         train_dataset = HITUAVDataset(
-            root_dir=args.data_dir, split='train', transform=train_transform, use_person_vehicle=True
+            root_dir=hituav_root, split='train', transform=train_transform, use_person_vehicle=True
         )
         val_dataset = HITUAVDataset(
-            root_dir=args.data_dir, split='val', transform=val_transform, use_person_vehicle=True
+            root_dir=hituav_root, split='val', transform=val_transform, use_person_vehicle=True
         )
         collate_fn = collate_fn_single
     elif args.dataset == 'smod':
+        smod_root = args.smod_dir
+        print(f"Loading SMOD dataset from: {smod_root}")
         train_dataset = SMODDataset(
-            root_dir=args.data_dir, split='train', transform=train_transform
+            root_dir=smod_root, split='train', transform=train_transform
         )
         val_dataset = SMODDataset(
-            root_dir=args.data_dir, split='val', transform=val_transform
+            root_dir=smod_root, split='val', transform=val_transform
         )
         if args.smod_subset_ratio < 1.0:
             rng = torch.Generator().manual_seed(42)
