@@ -48,8 +48,9 @@ def decode_bbox(predictions, grid_points, stride):
 
         dx, dy, dw, dh = predictions[..., 0], predictions[..., 1], predictions[..., 2], predictions[..., 3]
 
-        dx = torch.sigmoid(dx) * stride
-        dy = torch.sigmoid(dy) * stride
+        # Centered sigmoid: range (-0.5*stride, 1.5*stride) — allows offsets in both directions
+        dx = (2.0 * torch.sigmoid(dx) - 0.5) * stride
+        dy = (2.0 * torch.sigmoid(dy) - 0.5) * stride
         dw = torch.exp(torch.clamp(dw, max=10)) * stride
         dh = torch.exp(torch.clamp(dh, max=10)) * stride
 
@@ -66,8 +67,8 @@ def decode_bbox(predictions, grid_points, stride):
             raise ValueError(f"grid_points shape {grid_points.shape} doesn't match predictions shape {predictions.shape}")
 
         dx, dy, dw, dh = predictions[..., 0], predictions[..., 1], predictions[..., 2], predictions[..., 3]
-        dx = torch.sigmoid(dx) * stride
-        dy = torch.sigmoid(dy) * stride
+        dx = (2.0 * torch.sigmoid(dx) - 0.5) * stride
+        dy = (2.0 * torch.sigmoid(dy) - 0.5) * stride
         dw = torch.exp(torch.clamp(dw, max=10)) * stride
         dh = torch.exp(torch.clamp(dh, max=10)) * stride
 
@@ -183,9 +184,9 @@ def assign_targets_to_predictions(predictions_list, grid_points_list, strides, t
             inside = (gx >= x1.unsqueeze(0)) & (gx <= x2.unsqueeze(0)) & \
                      (gy >= y1.unsqueeze(0)) & (gy <= y2.unsqueeze(0))  # (H*W, M)
             
-            # Also add top-k closest grid cells per GT (k=3) as candidates
+            # Also add top-k closest grid cells per GT (k=9) as candidates
             dist = torch.sqrt((gx - gt_cx.unsqueeze(0))**2 + (gy - gt_cy.unsqueeze(0))**2)  # (H*W, M)
-            topk_k = min(3, H * W)
+            topk_k = min(9, H * W)
             _, topk_idx = dist.topk(topk_k, dim=0, largest=False)  # (k, M)
             topk_mask = torch.zeros_like(inside)
             for m in range(gt_boxes.shape[0]):

@@ -135,6 +135,10 @@ class FusionYOLOv11(nn.Module):
         
         # YOLOv11 detection head
         self.detection_head = YOLOv11Head(in_channels=256, num_classes=num_classes, num_anchors=1)
+        
+        # Loss function (created once, not per forward pass)
+        from .yolo_head import YOLOv11Loss
+        self.loss_fn = YOLOv11Loss(num_classes=num_classes)
     
     def forward(self, rgb_images, thermal_images, targets=None):
         """
@@ -169,15 +173,9 @@ class FusionYOLOv11(nn.Module):
         predictions = self.detection_head(panet_features)
         
         if self.training and targets is not None:
-            # Compute loss
-            from .yolo_head import YOLOv11Loss
-            
-            # Get image size
             B, C, H, W = rgb_images.shape
             image_size = (H, W)
-            
-            loss_fn = YOLOv11Loss(num_classes=self.num_classes)
-            loss_dict = loss_fn(predictions, targets, image_size=image_size)
+            loss_dict = self.loss_fn(predictions, targets, image_size=image_size)
             return loss_dict
         else:
             # Inference: return predictions
@@ -195,9 +193,9 @@ class FusionYOLOv11(nn.Module):
         Returns:
             List of detection results, each with 'boxes', 'scores', 'labels'
         """
+        was_training = self.training
         self.eval()
         with torch.no_grad():
-            # Convert lists to tensors if needed
             if isinstance(rgb_images, list):
                 rgb_images = torch.stack(rgb_images, dim=0)
             if isinstance(thermal_images, list):
@@ -205,16 +203,14 @@ class FusionYOLOv11(nn.Module):
             
             predictions = self.forward(rgb_images, thermal_images)
             
-            # Get image size
             B, C, H, W = rgb_images.shape
             image_size = (H, W)
             
-            # Generate grid points and strides
             from .yolo_utils import generate_grid_points, post_process_predictions
             
             cls_preds = predictions['cls']
             num_scales = len(cls_preds)
-            strides = [8 * (2 ** i) for i in range(num_scales)]
+            strides = [4 * (2 ** i) for i in range(num_scales)]
             grid_points_list = []
             
             device = cls_preds[0].device
@@ -223,12 +219,13 @@ class FusionYOLOv11(nn.Module):
                 grid_points = generate_grid_points((H_f, W_f), strides[scale_idx], device=device)
                 grid_points_list.append(grid_points)
             
-            # Post-process predictions
             results = post_process_predictions(
                 predictions, grid_points_list, strides,
                 conf_threshold=conf_threshold,
                 nms_threshold=nms_threshold,
                 max_detections=100
             )
-            
-            return results
+        
+        if was_training:
+            self.train()
+        return results

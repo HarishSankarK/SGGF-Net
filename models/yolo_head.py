@@ -66,7 +66,7 @@ class YOLOv11Head(nn.Module):
         self._initialize_weights()
     
     def _initialize_weights(self):
-        """Initialize weights using Kaiming initialization"""
+        """Initialize weights with proper priors for fast convergence"""
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -75,6 +75,16 @@ class YOLOv11Head(nn.Module):
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
+        
+        # Initialize objectness head final layer bias to predict "no object" initially
+        # sigmoid(-4.6) ≈ 0.01 — model starts by saying "no object" everywhere
+        # and only learns to activate for real objects
+        obj_final_conv = self.obj_head[-1]
+        nn.init.constant_(obj_final_conv.bias, -4.6)
+        
+        # Initialize classification head final layer bias similarly
+        cls_final_conv = self.cls_head[-1]
+        nn.init.constant_(cls_final_conv.bias, -4.6)
     
     def forward(self, features):
         """
@@ -127,22 +137,33 @@ class YOLOv11Loss(nn.Module):
     Combines classification, objectness, and bounding box regression losses
     """
     
-    def __init__(self, num_classes=80, obj_weight=1.0, cls_weight=1.0, bbox_weight=5.0):
+    def __init__(self, num_classes=80, obj_weight=1.0, cls_weight=1.0, bbox_weight=5.0,
+                 focal_alpha=0.25, focal_gamma=2.0):
         """
         Args:
             num_classes: Number of classes
             obj_weight: Weight for objectness loss
             cls_weight: Weight for classification loss
             bbox_weight: Weight for bounding box regression loss
+            focal_alpha: Focal loss alpha (balances pos/neg)
+            focal_gamma: Focal loss gamma (focuses on hard examples)
         """
         super(YOLOv11Loss, self).__init__()
         self.num_classes = num_classes
         self.obj_weight = obj_weight
         self.cls_weight = cls_weight
         self.bbox_weight = bbox_weight
-        
-        # BCE for classification and objectness
-        self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')
+        self.focal_alpha = focal_alpha
+        self.focal_gamma = focal_gamma
+    
+    def focal_loss(self, logits, targets):
+        """Focal loss: down-weights easy examples, focuses on hard ones"""
+        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+        p = torch.sigmoid(logits)
+        p_t = p * targets + (1 - p) * (1 - targets)
+        alpha_t = self.focal_alpha * targets + (1 - self.focal_alpha) * (1 - targets)
+        focal_weight = alpha_t * (1 - p_t) ** self.focal_gamma
+        return (focal_weight * bce).mean()
         
     def ciou_loss(self, pred_boxes, target_boxes):
         """
@@ -218,8 +239,9 @@ class YOLOv11Loss(nn.Module):
         device = cls_preds[0].device
         
         # Generate grid points and strides for each scale
-        # Strides: [8, 16, 32, 64, 128] for P2, P3, P4, P5, P6
-        strides = [8 * (2 ** i) for i in range(num_scales)]
+        # Strides: [4, 8, 16, 32, 64] for P2, P3, P4, P5, P6
+        # ResNet: C2=1/4, C3=1/8, C4=1/16, C5=1/32; P6=max_pool(P5)=1/64
+        strides = [4 * (2 ** i) for i in range(num_scales)]
         grid_points_list = []
         
         for scale_idx in range(num_scales):
@@ -237,10 +259,11 @@ class YOLOv11Loss(nn.Module):
             pos_threshold=0.5, neg_threshold=0.4
         )
         
-        # Compute losses
-        total_obj_loss = 0.0
-        total_cls_loss = 0.0
-        total_bbox_loss = 0.0
+        # Compute losses (tensors on correct device for consistent return types)
+        zero = torch.zeros(1, device=device).squeeze()
+        total_obj_loss = zero.clone()
+        total_cls_loss = zero.clone()
+        total_bbox_loss = zero.clone()
         num_positives = 0
         
         for scale_idx in range(num_scales):
@@ -258,23 +281,20 @@ class YOLOv11Loss(nn.Module):
             cls_targets = assigned['cls_targets']  # (B, H, W)
             bbox_targets = assigned['bbox_targets']  # (B, H, W, 4)
             
-            # Objectness loss (BCE)
-            obj_loss = self.bce_loss(obj_pred, obj_targets)
-            obj_loss = obj_loss.mean()
+            # Objectness loss (focal loss — focuses on hard examples)
+            obj_loss = self.focal_loss(obj_pred, obj_targets)
             total_obj_loss += obj_loss
             
-            # Classification loss (BCE per class)
+            # Classification loss (focal loss per class, positives only)
             pos_mask = obj_targets > 0.5  # (B, H, W)
             if pos_mask.any():
                 cls_pred_pos = cls_pred[pos_mask]  # (N_pos, num_classes)
                 cls_targets_pos = cls_targets[pos_mask]  # (N_pos,)
                 
-                # One-hot encode targets
                 cls_targets_onehot = torch.zeros_like(cls_pred_pos)
                 cls_targets_onehot.scatter_(1, cls_targets_pos.unsqueeze(1), 1.0)
                 
-                cls_loss = self.bce_loss(cls_pred_pos, cls_targets_onehot)
-                cls_loss = cls_loss.mean()
+                cls_loss = self.focal_loss(cls_pred_pos, cls_targets_onehot)
                 total_cls_loss += cls_loss
                 num_positives += pos_mask.sum().item()
             
@@ -311,8 +331,8 @@ class YOLOv11Loss(nn.Module):
         
         # Average across scales
         total_obj_loss = total_obj_loss / num_scales
-        total_cls_loss = total_cls_loss / max(num_scales, 1)
-        total_bbox_loss = total_bbox_loss / max(num_scales, 1)
+        total_cls_loss = total_cls_loss / num_scales
+        total_bbox_loss = total_bbox_loss / num_scales
         
         # Weighted combination
         total_loss = (self.obj_weight * total_obj_loss + 

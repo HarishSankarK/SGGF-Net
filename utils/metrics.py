@@ -180,6 +180,11 @@ def calculate_map(predictions, targets, num_classes, iou_thresholds=[0.5, 0.55, 
                 
                 ap = calculate_ap(recalls, precisions)
                 class_aps.append(ap)
+            else:
+                # No predictions for this class — AP=0 if GT exists
+                total_gt = sum(len(gt) for gt in gt_boxes_by_img)
+                if total_gt > 0:
+                    class_aps.append(0.0)
         
         # Average AP across classes
         if class_aps:

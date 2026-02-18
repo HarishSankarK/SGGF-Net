@@ -10,7 +10,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, ConcatDataset, Subset
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+# CosineAnnealingLR no longer used — we use LambdaLR and OneCycleLR instead
+import math
 import numpy as np
 from tqdm import tqdm
 
@@ -65,8 +66,9 @@ def collate_fn_combined(batch):
     return rgb_images, thermal_images, targets
 
 
-def train_one_epoch(model, dataloader, optimizer, device, epoch, scaler=None, use_amp=False, grad_clip=1.0):
-    """Train for one epoch"""
+def train_one_epoch(model, dataloader, optimizer, device, epoch, scaler=None, use_amp=False, grad_clip=1.0, 
+                     step_scheduler=None, ema=None):
+    """Train for one epoch. step_scheduler is stepped per batch (OneCycleLR), ema is updated per batch."""
     model.train()
     total_loss = 0.0
     num_batches = 0
@@ -136,7 +138,6 @@ def train_one_epoch(model, dataloader, optimizer, device, epoch, scaler=None, us
         
         if use_amp and device.type == 'cuda':
             scaler.scale(loss).backward()
-            # Gradient clipping before optimizer step
             if grad_clip > 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -144,10 +145,14 @@ def train_one_epoch(model, dataloader, optimizer, device, epoch, scaler=None, us
             scaler.update()
         else:
             loss.backward()
-            # Gradient clipping before optimizer step
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
+        
+        if step_scheduler is not None:
+            step_scheduler.step()
+        if ema is not None:
+            ema.update(model)
         
         total_loss += loss.item()
         num_batches += 1
@@ -167,6 +172,62 @@ def train_one_epoch(model, dataloader, optimizer, device, epoch, scaler=None, us
     
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
     return avg_loss
+
+
+class ModelEMA:
+    """Exponential Moving Average of model weights for better generalization.
+    Keeps a shadow copy of weights that averages over training steps."""
+    
+    def __init__(self, model, decay=0.9999):
+        self.ema = {k: v.clone().detach() for k, v in model.state_dict().items()}
+        self.decay = decay
+    
+    def update(self, model):
+        with torch.no_grad():
+            for k, v in model.state_dict().items():
+                if v.is_floating_point():
+                    self.ema[k].mul_(self.decay).add_(v, alpha=1 - self.decay)
+                else:
+                    self.ema[k].copy_(v)
+    
+    def apply(self, model):
+        """Temporarily load EMA weights into model (for validation)"""
+        return self.ema
+    
+    def state_dict(self):
+        return self.ema
+    
+    def load_state_dict(self, state_dict):
+        self.ema = {k: v.clone().detach() for k, v in state_dict.items()}
+
+
+def get_param_groups(model, base_lr):
+    """Create parameter groups with differential learning rates.
+    Backbone: 1x lr, Fusion/GFEM: 5x lr, Head: 10x lr"""
+    backbone_params = []
+    fusion_params = []
+    head_params = []
+    
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if 'backbone' in name and 'fusion_conv' not in name:
+            backbone_params.append(param)
+        elif 'detection_head' in name or 'panet' in name:
+            head_params.append(param)
+        else:
+            fusion_params.append(param)
+    
+    param_groups = [
+        {'params': backbone_params, 'lr': base_lr, 'name': 'backbone'},
+        {'params': fusion_params, 'lr': base_lr * 5, 'name': 'fusion/gfem'},
+        {'params': head_params, 'lr': base_lr * 10, 'name': 'head/panet'},
+    ]
+    
+    counts = [len(backbone_params), len(fusion_params), len(head_params)]
+    print(f'  Param groups: backbone({counts[0]} @{base_lr:.0e}), '
+          f'fusion({counts[1]} @{base_lr*5:.0e}), head({counts[2]} @{base_lr*10:.0e})')
+    return param_groups
 
 
 def freeze_backbone_layers(model, freeze_early=True, freeze_layers=['layer0', 'layer1', 'layer2']):
@@ -380,6 +441,8 @@ def main():
                        help='Number of epochs to train with frozen backbone, then unfreeze (progressive unfreezing)')
     parser.add_argument('--stage', type=int, default=None, choices=[1, 2, 3],
                        help='Stage-by-stage training (faster): 1=backbone+fusion+head, 2=GFEM only, 3=full fine-tune. Use --resume to chain stages.')
+    parser.add_argument('--single_pass', action='store_true',
+                       help='Single-pass training (recommended): differential LR + OneCycleLR + EMA. No stages needed.')
     parser.add_argument('--max_size', type=int, default=640,
                        help='Max image size for resize (default 640 for Colab T4, use 1024/1536 if GPU has more memory)')
     parser.add_argument('--val_conf_threshold', type=float, default=0.25,
@@ -650,24 +713,87 @@ def main():
     #     print('  Continuing without compilation...')
     print('⚠ Model compilation disabled (causes NaN losses with this architecture)')
     
-    # Stage-by-stage OR transfer learning: freeze layers BEFORE creating optimizer
-    if args.stage is not None:
+    # Training mode selection
+    ema = None
+    use_single_pass = args.single_pass
+    
+    if use_single_pass:
+        # Single-pass: train all layers with differential LR, no stages needed
+        print('✓ Single-pass training mode (differential LR + OneCycleLR + EMA)')
+        # Freeze only early backbone layers (layer0, layer1) — train everything else
+        freeze_layers = ['layer0', 'layer1']
+        for name, param in model.dual_stream.rgb_backbone.named_parameters():
+            if any(l in name for l in freeze_layers):
+                param.requires_grad = False
+        for name, param in model.dual_stream.thermal_backbone.named_parameters():
+            if any(l in name for l in freeze_layers):
+                param.requires_grad = False
+        print(f'  Frozen: backbone layer0/1 (pretrained low-level features)')
+        print(f'  Training: layer2/3/4 + GFEM + fusion + PANet + head')
+        
+        param_groups = get_param_groups(model, args.lr)
+        optimizer = AdamW(param_groups, lr=args.lr, weight_decay=5e-4)
+        
+        steps_per_epoch = len(train_loader)
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=[args.lr, args.lr * 5, args.lr * 10],
+            epochs=args.epochs,
+            steps_per_epoch=steps_per_epoch,
+            pct_start=0.1,
+            anneal_strategy='cos',
+            div_factor=10,
+            final_div_factor=100
+        )
+        
+        ema = ModelEMA(model, decay=0.9999)
+        print(f'  EMA enabled (decay=0.9999)')
+        print(f'  OneCycleLR: warmup 10% → cosine decay, {args.epochs} epochs')
+    elif args.stage is not None:
         freeze_for_stage(model, args.stage)
-        # Stage-specific epochs and learning rate (shorter = faster per stage)
-        stage_epochs = {1: 30, 2: 20, 3: 30}  # Total ~80 epochs across 3 stages
-        stage_lr = {1: 5e-5, 2: 1e-5, 3: 5e-6}
+        stage_epochs = {1: 30, 2: 20, 3: 30}
+        stage_lr = {1: 2e-4, 2: 5e-5, 3: 1e-5}
         args.epochs = stage_epochs.get(args.stage, args.epochs)
         args.lr = stage_lr.get(args.stage, args.lr)
         print(f'  Stage {args.stage}: {args.epochs} epochs, lr={args.lr}')
+        
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=5e-4)
+        warmup_epochs = min(3, args.epochs)
+        def lr_lambda(epoch):
+            if epoch < warmup_epochs:
+                return (epoch + 1) / warmup_epochs
+            else:
+                progress = (epoch - warmup_epochs) / max(1, args.epochs - warmup_epochs)
+                return 0.5 * (1 + math.cos(math.pi * progress))
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        print(f'  LR schedule: warmup {warmup_epochs} epochs → cosine decay')
     elif args.freeze_backbone:
         freeze_backbone_layers(model, freeze_early=True)
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=5e-4)
+        warmup_epochs = min(3, args.epochs)
+        def lr_lambda(epoch):
+            if epoch < warmup_epochs:
+                return (epoch + 1) / warmup_epochs
+            else:
+                progress = (epoch - warmup_epochs) / max(1, args.epochs - warmup_epochs)
+                return 0.5 * (1 + math.cos(math.pi * progress))
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        print(f'  LR schedule: warmup {warmup_epochs} epochs → cosine decay')
     else:
         print('✓ Training all layers (no freezing)')
-    
-    # Optimizer: Only include trainable parameters (important for frozen layers)
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=5e-4)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=5e-4)
+        warmup_epochs = min(3, args.epochs)
+        def lr_lambda(epoch):
+            if epoch < warmup_epochs:
+                return (epoch + 1) / warmup_epochs
+            else:
+                progress = (epoch - warmup_epochs) / max(1, args.epochs - warmup_epochs)
+                return 0.5 * (1 + math.cos(math.pi * progress))
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        print(f'  LR schedule: warmup {warmup_epochs} epochs → cosine decay')
     
     # Mixed precision scaler (fixed deprecation warning)
     if args.use_amp and device.type == 'cuda':
@@ -703,32 +829,69 @@ def main():
                 checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
             except TypeError:
                 checkpoint = torch.load(args.resume, map_location=device)
-            model.load_state_dict(checkpoint['model_state_dict'])
-            # Note: When resuming with frozen layers or different stage, optimizer state may not match
+            # For EMA: load raw model weights for training, not the smoothed EMA weights
+            if use_single_pass and 'model_state_dict_raw' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict_raw'])
+            else:
+                model.load_state_dict(checkpoint['model_state_dict'])
             try:
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             except Exception:
-                print('  Warning: Optimizer state mismatch (possibly due to freezing/stage). Recreating optimizer...')
-                trainable_params = [p for p in model.parameters() if p.requires_grad]
-                optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=5e-4)
+                print('  Warning: Optimizer state mismatch. Recreating optimizer...')
+                if use_single_pass:
+                    param_groups = get_param_groups(model, args.lr)
+                    optimizer = AdamW(param_groups, lr=args.lr, weight_decay=5e-4)
+                    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                        optimizer,
+                        max_lr=[args.lr, args.lr * 5, args.lr * 10],
+                        epochs=args.epochs,
+                        steps_per_epoch=len(train_loader),
+                        pct_start=0.1, anneal_strategy='cos',
+                        div_factor=10, final_div_factor=100
+                    )
+                else:
+                    trainable_params = [p for p in model.parameters() if p.requires_grad]
+                    optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=5e-4)
+                    warmup_epochs_r = min(3, args.epochs)
+                    def lr_lambda_resume(epoch, _we=warmup_epochs_r, _te=args.epochs):
+                        if epoch < _we:
+                            return (epoch + 1) / _we
+                        else:
+                            progress = (epoch - _we) / max(1, _te - _we)
+                            return 0.5 * (1 + math.cos(math.pi * progress))
+                    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda_resume)
             if 'scheduler_state_dict' in checkpoint:
                 try:
                     scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
                 except Exception:
-                    pass
-            # Within-stage resume: continue from last completed epoch; chaining stages: start from 0
+                    print('  Warning: Scheduler state mismatch, using fresh scheduler')
+                    if use_single_pass and start_epoch > 0:
+                        skip_steps = start_epoch * len(train_loader)
+                        print(f'  Fast-forwarding OneCycleLR by {skip_steps} steps...')
+                        for _ in range(skip_steps):
+                            scheduler.step()
             ckpt_stage = checkpoint.get('stage')
             ckpt_epoch = checkpoint.get('epoch', 0)
-            if ckpt_stage == args.stage and ckpt_epoch < args.epochs:
-                start_epoch = ckpt_epoch  # Resume within same stage (0-indexed next epoch)
+            ckpt_single_pass = checkpoint.get('single_pass', False)
+            
+            if use_single_pass and ckpt_single_pass and ckpt_epoch < args.epochs:
+                start_epoch = ckpt_epoch
+                print(f'  Resuming single-pass training from epoch {ckpt_epoch + 1}/{args.epochs}')
+            elif ckpt_stage == args.stage and ckpt_epoch < args.epochs:
+                start_epoch = ckpt_epoch
                 print(f'  Resuming within Stage {args.stage} from epoch {ckpt_epoch + 1}/{args.epochs}')
             else:
-                start_epoch = 0  # Chaining stages or fresh start
-                print(f'  Starting Stage {args.stage} from epoch 1 (chaining or new run)')
+                start_epoch = 0
+                print(f'  Starting from epoch 1 (new mode or chaining stages)')
             best_map = checkpoint.get('best_map', 0.0)
             if scaler is not None and 'scaler_state_dict' in checkpoint:
                 scaler.load_state_dict(checkpoint['scaler_state_dict'])
                 print('  Loaded scaler state')
+            if ema is not None and 'ema_state_dict' in checkpoint:
+                ema.load_state_dict(checkpoint['ema_state_dict'])
+                print('  Loaded EMA state')
+            elif ema is not None:
+                ema = ModelEMA(model, decay=0.9999)
             print(f'  Resumed: Best mAP so far: {best_map:.4f}')
             print(f'  Continuing training from epoch {start_epoch + 1} to {args.epochs}')
     
@@ -745,22 +908,38 @@ def main():
             unfreeze_all_layers(model)
             # Recreate optimizer with all parameters now that we've unfrozen
             optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=5e-4)
-            # Adjust scheduler T_max for remaining epochs
             remaining_epochs = args.epochs - args.freeze_epochs
-            scheduler = CosineAnnealingLR(optimizer, T_max=remaining_epochs)
+            warmup_ep = min(3, remaining_epochs)
+            def lr_lambda_unfreeze(ep, _we=warmup_ep, _re=remaining_epochs):
+                if ep < _we:
+                    return (ep + 1) / _we
+                else:
+                    progress = (ep - _we) / max(1, _re - _we)
+                    return 0.5 * (1 + math.cos(math.pi * progress))
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda_unfreeze)
             print(f'  Recreated optimizer with all parameters')
             print(f'  Adjusted scheduler for {remaining_epochs} remaining epochs')
-        # Train
+        # Train — pass step_scheduler for OneCycleLR (steps per batch)
+        step_sched = scheduler if use_single_pass else None
         train_loss = train_one_epoch(
-            model, train_loader, optimizer, device, epoch, scaler, args.use_amp, args.grad_clip
+            model, train_loader, optimizer, device, epoch, scaler, args.use_amp, args.grad_clip,
+            step_scheduler=step_sched, ema=ema
         )
         
-        # Validate
-        val_map, val_ap50 = validate(model, val_loader, device, epoch, args.num_classes, 
-                                     conf_threshold=args.val_conf_threshold)
+        # Validate — use EMA weights if available
+        if ema is not None:
+            orig_state = {k: v.clone() for k, v in model.state_dict().items()}
+            model.load_state_dict(ema.apply(model))
+            val_map, val_ap50 = validate(model, val_loader, device, epoch, args.num_classes, 
+                                         conf_threshold=args.val_conf_threshold)
+            model.load_state_dict(orig_state)
+        else:
+            val_map, val_ap50 = validate(model, val_loader, device, epoch, args.num_classes, 
+                                         conf_threshold=args.val_conf_threshold)
         
-        # Update learning rate
-        scheduler.step()
+        # Update LR — epoch-level schedulers only (not OneCycleLR which steps per batch)
+        if not use_single_pass:
+            scheduler.step()
         
         print(f'Epoch {epoch+1}/{args.epochs}:')
         print(f'  Train Loss: {train_loss:.4f}')
@@ -769,19 +948,22 @@ def main():
         # Save checkpoint
         checkpoint = {
             'epoch': epoch + 1,
-            'model_state_dict': model.state_dict(),
+            'model_state_dict': ema.state_dict() if ema is not None else model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'best_map': best_map,
             'val_map': val_map,
             'val_ap50': val_ap50,
             'args': vars(args),
-            'stage': args.stage
+            'stage': args.stage,
+            'single_pass': use_single_pass
         }
         
-        # Save scaler state if using AMP
         if scaler is not None:
             checkpoint['scaler_state_dict'] = scaler.state_dict()
+        if ema is not None:
+            checkpoint['ema_state_dict'] = ema.state_dict()
+            checkpoint['model_state_dict_raw'] = model.state_dict()
         
         # Save latest checkpoint (always)
         latest_path = os.path.join(args.checkpoint_dir, 'latest.pth')

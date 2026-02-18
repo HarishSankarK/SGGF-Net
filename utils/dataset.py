@@ -352,7 +352,7 @@ class HITUAVDataset(Dataset):
         
         # Try TXT format (YOLO style - HIT-UAV uses this format)
         txt_path = os.path.join(self.annotation_dir, base_name + '.txt') if self.annotation_dir else None
-        if txt_path and os.path.exists(txt_path):
+        if txt_path and os.path.exists(txt_path) and not boxes:
             with open(txt_path, 'r') as f:
                 for line in f:
                     line = line.strip()
@@ -713,8 +713,14 @@ class DroneRGBTDataset(Dataset):
         }
         
         if self.transform:
-            # Apply transform to both images (they should be transformed together)
+            import copy
+            # Seed RNG so both images get identical random transforms (same flip, same resize)
+            seed = torch.randint(0, 2**31, (1,)).item()
+            torch.manual_seed(seed)
             rgb_image, target = self.transform(rgb_image, target)
-            thermal_image, _ = self.transform(thermal_image, target)
+            # Deep-copy target before 2nd transform to avoid double-scaling boxes
+            target_copy = copy.deepcopy(target)
+            torch.manual_seed(seed)
+            thermal_image, _ = self.transform(thermal_image, {'boxes': torch.zeros((0, 4)), 'labels': torch.zeros((0,), dtype=torch.int64)})
         
         return (rgb_image, thermal_image), target

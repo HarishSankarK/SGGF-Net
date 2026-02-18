@@ -97,8 +97,8 @@ class Pad:
         pad_w = max(0, max_w - w)
         
         if pad_h > 0 or pad_w > 0:
-            # Pad: (left, right, top, bottom)
-            image = F.pad(image, (0, pad_w, 0, pad_h), fill=self.fill)
+            # torchvision F.pad uses (left, top, right, bottom) — pad right and bottom only
+            image = F.pad(image, [0, 0, pad_w, pad_h], fill=self.fill)
         
         return image, target
 
