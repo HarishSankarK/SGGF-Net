@@ -93,10 +93,10 @@ def train_one_epoch(model, dataloader, optimizer, device, epoch, scaler=None, us
             if use_amp and device.type == 'cuda':
                 with torch.autocast(device_type='cuda', dtype=torch.float16):
                     loss_dict = model(rgb_images, thermal_images, targets)
-                    loss = sum(loss for loss in loss_dict.values())
+                    loss = loss_dict['total_loss']
             else:
                 loss_dict = model(rgb_images, thermal_images, targets)
-                loss = sum(loss for loss in loss_dict.values())
+                loss = loss_dict['total_loss']
         else:
             # Single modality - create dummy thermal images for now
             images, targets = batch_data
@@ -113,8 +113,7 @@ def train_one_epoch(model, dataloader, optimizer, device, epoch, scaler=None, us
             if use_amp and device.type == 'cuda':
                 with torch.autocast(device_type='cuda', dtype=torch.float16):
                     loss_dict = model(images, thermal_images, targets)
-                    loss = sum(loss for loss in loss_dict.values())
-                    # Check for NaN in individual loss components
+                    loss = loss_dict['total_loss']
                     if any(torch.isnan(l) or torch.isinf(l) for l in loss_dict.values()):
                         print(f'\n⚠️  Warning: NaN/Inf in loss components at batch {batch_idx}!')
                         for k, v in loss_dict.items():
@@ -122,8 +121,7 @@ def train_one_epoch(model, dataloader, optimizer, device, epoch, scaler=None, us
                                 print(f'  {k}: {v.item()}')
             else:
                 loss_dict = model(images, thermal_images, targets)
-                loss = sum(loss for loss in loss_dict.values())
-                # Check for NaN in individual loss components
+                loss = loss_dict['total_loss']
                 if any(torch.isnan(l) or torch.isinf(l) for l in loss_dict.values()):
                     print(f'\n⚠️  Warning: NaN/Inf in loss components at batch {batch_idx}!')
                     for k, v in loss_dict.items():
@@ -157,17 +155,15 @@ def train_one_epoch(model, dataloader, optimizer, device, epoch, scaler=None, us
         total_loss += loss.item()
         num_batches += 1
         
-        # Update progress bar with loss components
+        # Update progress bar with loss breakdown
         if batch_idx % 10 == 0 or batch_idx == len(dataloader) - 1:
             postfix = {
                 'loss': f'{loss.item():.4f}',
                 'avg_loss': f'{total_loss/num_batches:.4f}'
             }
-            # Show loss breakdown on first batch of epoch
-            if batch_idx == 0:
-                for k, v in loss_dict.items():
-                    if isinstance(v, torch.Tensor):
-                        postfix[k] = f'{v.item():.4f}'
+            for k, v in loss_dict.items():
+                if isinstance(v, torch.Tensor) and k != 'total_loss':
+                    postfix[k] = f'{v.item():.4f}'
             progress_bar.set_postfix(postfix)
     
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
@@ -372,7 +368,7 @@ def validate(model, dataloader, device, epoch, num_classes, conf_threshold=0.01)
             all_targets.extend(targets)
     
     # Compute metrics
-    from utils.metrics import calculate_map, calculate_ap50
+    from utils.metrics import calculate_map, calculate_ap50, calculate_ap25
     
     # Pass tensors on CPU to calculate_map (it uses torch.cat and torch ops)
     formatted_targets = []
@@ -412,15 +408,34 @@ def validate(model, dataloader, device, epoch, num_classes, conf_threshold=0.01)
         all_scores = torch.cat([p['scores'] for p in formatted_predictions])
         print(f'  Val detections: {total_preds} total ({avg_preds:.1f}/img) @conf>{conf_threshold}')
         print(f'  Val score stats: min={all_scores.min():.4f}, max={all_scores.max():.4f}, mean={all_scores.mean():.4f}')
+        # Show sample boxes + IoU to debug coordinate issues
+        from utils.metrics import calculate_iou as _calc_iou
+        for i in range(min(5, len(formatted_predictions))):
+            p = formatted_predictions[i]
+            t = formatted_targets[i]
+            if len(p['boxes']) > 0 and len(t['boxes']) > 0:
+                top_idx = p['scores'].argmax()
+                pb = p['boxes'][top_idx:top_idx+1]
+                iou_matrix = _calc_iou(pb, t['boxes'])
+                best_iou = iou_matrix.max().item()
+                pw = (pb[0, 2] - pb[0, 0]).item()
+                ph = (pb[0, 3] - pb[0, 1]).item()
+                tw = (t['boxes'][0, 2] - t['boxes'][0, 0]).item()
+                th = (t['boxes'][0, 3] - t['boxes'][0, 1]).item()
+                print(f'  Sample img {i}: pred_box(xyxy)={[round(x, 1) for x in pb[0].tolist()]} size={pw:.0f}x{ph:.0f}, '
+                      f'gt_box={[round(x, 1) for x in t["boxes"][0].tolist()]} size={tw:.0f}x{th:.0f}, '
+                      f'best_IoU={best_iou:.4f}')
+                break
     else:
         print(f'  Val detections: 0 (no predictions above conf={conf_threshold})')
     print(f'  Val pred labels: {pred_hist}, GT labels: {gt_hist}')
     
-    # Compute mAP
+    # Compute mAP, AP50, AP25
     map_score = calculate_map(formatted_predictions, formatted_targets, num_classes)
     ap50_score = calculate_ap50(formatted_predictions, formatted_targets, num_classes)
+    ap25_score = calculate_ap25(formatted_predictions, formatted_targets, num_classes)
     
-    return map_score, ap50_score
+    return map_score, ap50_score, ap25_score
 
 
 def main():
@@ -965,12 +980,12 @@ def main():
         if ema is not None:
             orig_state = {k: v.clone() for k, v in model.state_dict().items()}
             model.load_state_dict(ema.apply(model))
-            val_map, val_ap50 = validate(model, val_loader, device, epoch, args.num_classes, 
-                                         conf_threshold=args.val_conf_threshold)
+            val_map, val_ap50, val_ap25 = validate(model, val_loader, device, epoch, args.num_classes, 
+                                                    conf_threshold=args.val_conf_threshold)
             model.load_state_dict(orig_state)
         else:
-            val_map, val_ap50 = validate(model, val_loader, device, epoch, args.num_classes, 
-                                         conf_threshold=args.val_conf_threshold)
+            val_map, val_ap50, val_ap25 = validate(model, val_loader, device, epoch, args.num_classes, 
+                                                    conf_threshold=args.val_conf_threshold)
         
         # Update LR — epoch-level schedulers only (not OneCycleLR which steps per batch)
         if not use_single_pass:
@@ -978,7 +993,7 @@ def main():
         
         print(f'Epoch {epoch+1}/{args.epochs}:')
         print(f'  Train Loss: {train_loss:.4f}')
-        print(f'  Val mAP: {val_map:.4f}, Val AP50: {val_ap50:.4f}')
+        print(f'  Val mAP: {val_map:.4f}, Val AP50: {val_ap50:.4f}, Val AP25: {val_ap25:.4f}')
         
         # Save checkpoint
         checkpoint = {

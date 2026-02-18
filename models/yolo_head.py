@@ -85,6 +85,14 @@ class YOLOv11Head(nn.Module):
         # Initialize classification head final layer bias similarly
         cls_final_conv = self.cls_head[-1]
         nn.init.constant_(cls_final_conv.bias, -4.6)
+        
+        # Initialize bbox dw/dh bias so initial predicted sizes are reasonable.
+        # Output channels [dx, dy, dw, dh]: exp(2.0)*stride gives ~7.4*stride,
+        # so P3(8)→59px, P4(16)→118px — close to typical person/vehicle sizes.
+        bbox_final_conv = self.bbox_head[-1]
+        with torch.no_grad():
+            bbox_final_conv.bias[2] = 2.0  # dw
+            bbox_final_conv.bias[3] = 2.0  # dh
     
     def forward(self, features):
         """

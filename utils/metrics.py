@@ -201,6 +201,11 @@ def calculate_ap50(predictions, targets, num_classes, verbose=False):
     return calculate_map(predictions, targets, num_classes, iou_thresholds=[0.5], verbose=verbose)
 
 
+def calculate_ap25(predictions, targets, num_classes, verbose=False):
+    """Calculate AP at IoU threshold 0.25 (useful for early training diagnostics)"""
+    return calculate_map(predictions, targets, num_classes, iou_thresholds=[0.25], verbose=verbose)
+
+
 def calculate_precision_recall_f1(predictions, targets, num_classes, iou_threshold=0.5):
     """
     Calculate Precision, Recall, and F1 score
