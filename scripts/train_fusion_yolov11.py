@@ -947,6 +947,9 @@ def main():
     
     # Training loop
     print(f'Starting training for {args.epochs} epochs...')
+    log_path = os.path.join(args.checkpoint_dir, 'training_log.csv')
+    with open(log_path, 'w') as f:
+        f.write('epoch,train_loss,val_map,val_ap50,val_ap25\n')
     if args.freeze_backbone and args.freeze_epochs:
         print(f'  Transfer Learning: Training with frozen backbone for {args.freeze_epochs} epochs')
         print(f'  Then unfreezing for remaining {args.epochs - args.freeze_epochs} epochs')
@@ -994,6 +997,8 @@ def main():
         print(f'Epoch {epoch+1}/{args.epochs}:')
         print(f'  Train Loss: {train_loss:.4f}')
         print(f'  Val mAP: {val_map:.4f}, Val AP50: {val_ap50:.4f}, Val AP25: {val_ap25:.4f}')
+        with open(log_path, 'a') as f:
+            f.write(f'{epoch+1},{train_loss:.4f},{val_map:.4f},{val_ap50:.4f},{val_ap25:.4f}\n')
         
         # Save checkpoint
         checkpoint = {

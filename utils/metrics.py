@@ -206,6 +206,80 @@ def calculate_ap25(predictions, targets, num_classes, verbose=False):
     return calculate_map(predictions, targets, num_classes, iou_thresholds=[0.25], verbose=verbose)
 
 
+def get_precision_recall_curves(predictions, targets, num_classes, iou_threshold=0.5):
+    """
+    Get precision-recall curves for each class (for PR curve plotting).
+    
+    Returns:
+        dict: {class_id: (precisions, recalls)} where precisions/recalls are numpy arrays
+    """
+    curves = {}
+    class_names = {1: 'person', 2: 'vehicle', 3: 'other'}  # extend as needed
+    
+    for class_id in range(1, num_classes):
+        pred_boxes_by_img = []
+        pred_scores_by_img = []
+        gt_boxes_by_img = []
+        
+        for pred, target in zip(predictions, targets):
+            cm = pred['labels'] == class_id
+            pred_boxes_by_img.append(pred['boxes'][cm] if cm.any() else torch.zeros(0, 4))
+            pred_scores_by_img.append(pred['scores'][cm] if cm.any() else torch.zeros(0))
+            gm = target['labels'] == class_id
+            gt_boxes_by_img.append(target['boxes'][gm] if gm.any() else torch.zeros(0, 4))
+        
+        all_pred_boxes = []
+        all_pred_scores = []
+        pred_img_indices = []
+        for img_idx, (pb, ps) in enumerate(zip(pred_boxes_by_img, pred_scores_by_img)):
+            if len(pb) > 0:
+                all_pred_boxes.append(pb)
+                all_pred_scores.append(ps)
+                pred_img_indices.extend([img_idx] * len(pb))
+        
+        if len(all_pred_boxes) == 0:
+            total_gt = sum(len(g) for g in gt_boxes_by_img)
+            if total_gt > 0:
+                curves[class_id] = (np.array([0.]), np.array([0.]))  # No preds, AP=0
+            else:
+                curves[class_id] = (np.array([1.]), np.array([1.]))  # No GT, skip
+            continue
+        
+        all_pred_boxes = torch.cat(all_pred_boxes, dim=0)
+        all_pred_scores = torch.cat(all_pred_scores, dim=0)
+        sorted_idx = torch.argsort(all_pred_scores, descending=True)
+        all_pred_boxes = all_pred_boxes[sorted_idx]
+        all_pred_scores = all_pred_scores[sorted_idx]
+        pred_img_indices = [pred_img_indices[i] for i in sorted_idx]
+        
+        tp = torch.zeros(len(all_pred_boxes))
+        fp = torch.zeros(len(all_pred_boxes))
+        gt_matched = [torch.zeros(len(g), dtype=torch.bool) for g in gt_boxes_by_img]
+        total_gt = sum(len(g) for g in gt_boxes_by_img)
+        
+        for i, (pred_box, img_idx) in enumerate(zip(all_pred_boxes, pred_img_indices)):
+            img_gt = gt_boxes_by_img[img_idx]
+            if len(img_gt) > 0:
+                ious = calculate_iou(pred_box.unsqueeze(0), img_gt)
+                max_iou, gt_idx = ious.max(dim=1)
+                mi, gi = max_iou.item(), gt_idx.item()
+                if mi >= iou_threshold and not gt_matched[img_idx][gi]:
+                    tp[i] = 1
+                    gt_matched[img_idx][gi] = True
+                else:
+                    fp[i] = 1
+            else:
+                fp[i] = 1
+        
+        tp_cum = torch.cumsum(tp, dim=0).numpy()
+        fp_cum = torch.cumsum(fp, dim=0).numpy()
+        recalls = (tp_cum / total_gt) if total_gt > 0 else np.zeros(len(tp))
+        precisions = tp_cum / (tp_cum + fp_cum + 1e-6)
+        curves[class_id] = (precisions, recalls)
+    
+    return curves
+
+
 def calculate_precision_recall_f1(predictions, targets, num_classes, iou_threshold=0.5):
     """
     Calculate Precision, Recall, and F1 score

@@ -159,18 +159,44 @@ python scripts/train_fusion_yolov11.py --stage 3 --resume checkpoints/best.pth \
 
 ## Evaluation
 
+**Validation:**
 ```bash
 python scripts/evaluate_fusion.py \
-  --dataset combined_all \
-  --hituav_dir data/hit-uav \
-  --dronergbt_dir data/DroneRGBT \
-  --smod_dir data/SMOD \
-  --checkpoint checkpoints/best.pth \
+  --dataset smod \
+  --data_dir data/SMOD \
+  --checkpoint checkpoints_smod_fresh/best.pth \
   --num_classes 3 \
   --split val
 ```
 
-For low-VRAM GPUs: `--laptop` (batch=2, max_size=640)
+**Test:**
+```bash
+python scripts/evaluate_fusion.py \
+  --dataset smod \
+  --data_dir data/SMOD \
+  --checkpoint checkpoints_smod_fresh/best.pth \
+  --num_classes 3 \
+  --split test
+```
+
+For low-VRAM GPUs: `--laptop`. For CPU-only: `--cpu`.
+
+**Combined/other datasets:** Use `--dataset combined_all` with `--hituav_dir`, `--dronergbt_dir`, `--smod_dir` as needed.
+
+### Figure Generation (for manuscript)
+
+Generates PR curves, confusion matrix, mAP vs IoU, metrics bar chart, detection examples, and training curves:
+
+```bash
+python scripts/generate_eval_figures.py \
+  --dataset smod \
+  --data_dir data/SMOD \
+  --checkpoint checkpoints_smod_fresh/best.pth \
+  --output_dir ../Paper/figures \
+  --split val
+```
+
+For test split: `--split test`. Training curves use `training_log.csv` (auto-detected from checkpoint directory). CPU: add `--cpu`.
 
 ---
 
@@ -215,6 +241,7 @@ sggf_net/
 ├── scripts/
 │   ├── train_fusion_yolov11.py   # Main training (Fusion-YOLOv11)
 │   ├── evaluate_fusion.py        # Evaluation
+│   ├── generate_eval_figures.py  # PR curves, confusion matrix, etc.
 │   ├── preprocess_hituav.py      # HIT-UAV preprocessing
 │   ├── preprocess_dronergbt.py   # DroneRGBT preprocessing
 │   ├── preprocess_smod.py       # SMOD preprocessing
