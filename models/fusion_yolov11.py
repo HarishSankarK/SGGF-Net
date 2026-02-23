@@ -223,7 +223,8 @@ class FusionYOLOv11(nn.Module):
                 predictions, grid_points_list, strides,
                 conf_threshold=conf_threshold,
                 nms_threshold=nms_threshold,
-                max_detections=100
+                max_detections=100,
+                image_size=image_size
             )
         
         if was_training:

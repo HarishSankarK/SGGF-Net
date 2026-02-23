@@ -51,8 +51,9 @@ def decode_bbox(predictions, grid_points, stride):
         # Centered sigmoid: range (-0.5*stride, 1.5*stride) — allows offsets in both directions
         dx = (2.0 * torch.sigmoid(dx) - 0.5) * stride
         dy = (2.0 * torch.sigmoid(dy) - 0.5) * stride
-        dw = torch.exp(torch.clamp(dw, max=10)) * stride
-        dh = torch.exp(torch.clamp(dh, max=10)) * stride
+        # Clamp dw/dh to prevent exp explosion (avoids 700k+ box sizes from untrained predictions)
+        dw = torch.exp(torch.clamp(dw, max=3.5)) * stride
+        dh = torch.exp(torch.clamp(dh, max=3.5)) * stride
 
         x_center = grid[..., 0] + dx
         y_center = grid[..., 1] + dy
@@ -69,8 +70,9 @@ def decode_bbox(predictions, grid_points, stride):
         dx, dy, dw, dh = predictions[..., 0], predictions[..., 1], predictions[..., 2], predictions[..., 3]
         dx = (2.0 * torch.sigmoid(dx) - 0.5) * stride
         dy = (2.0 * torch.sigmoid(dy) - 0.5) * stride
-        dw = torch.exp(torch.clamp(dw, max=10)) * stride
-        dh = torch.exp(torch.clamp(dh, max=10)) * stride
+        # Clamp dw/dh to prevent exp explosion (avoids 700k+ box sizes from untrained predictions)
+        dw = torch.exp(torch.clamp(dw, max=3.5)) * stride
+        dh = torch.exp(torch.clamp(dh, max=3.5)) * stride
 
         x_center = grid[..., 0] + dx
         y_center = grid[..., 1] + dy
@@ -249,7 +251,7 @@ def assign_targets_to_predictions(predictions_list, grid_points_list, strides, t
 
 
 def post_process_predictions(predictions, grid_points_list, strides, conf_threshold=0.5, 
-                             nms_threshold=0.5, max_detections=100):
+                             nms_threshold=0.5, max_detections=100, image_size=None):
     """
     Post-process YOLOv11 predictions: decode, filter, NMS
     
@@ -350,6 +352,14 @@ def post_process_predictions(predictions, grid_points_list, strides, conf_thresh
                 # Convert to xyxy for output
                 cx, cy, w, h = final_boxes[:, 0], final_boxes[:, 1], final_boxes[:, 2], final_boxes[:, 3]
                 boxes_xyxy = torch.stack([cx - w/2, cy - h/2, cx + w/2, cy + h/2], dim=1)
+                # Clip to image bounds (prevents invalid coords from untrained/background predictions)
+                if image_size is not None:
+                    h_img, w_img = image_size
+                    boxes_xyxy = boxes_xyxy.clamp(min=0)
+                    boxes_xyxy[:, 0] = boxes_xyxy[:, 0].clamp(max=w_img)
+                    boxes_xyxy[:, 1] = boxes_xyxy[:, 1].clamp(max=h_img)
+                    boxes_xyxy[:, 2] = boxes_xyxy[:, 2].clamp(max=w_img)
+                    boxes_xyxy[:, 3] = boxes_xyxy[:, 3].clamp(max=h_img)
                 
                 results.append({
                     'boxes': boxes_xyxy,
