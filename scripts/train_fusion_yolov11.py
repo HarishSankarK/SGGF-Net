@@ -933,6 +933,8 @@ def main():
             print('Starting training from scratch...')
         else:
             print(f'Loading checkpoint: {args.resume}')
+            # When resuming from best.pth, use fresh optimizer (stale momentum often hurts) and lower LR
+            resuming_from_best = args.resume.rstrip('/').endswith('best.pth')
             try:
                 checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
             except TypeError:
@@ -942,8 +944,14 @@ def main():
                 model.load_state_dict(checkpoint['model_state_dict_raw'])
             else:
                 model.load_state_dict(checkpoint['model_state_dict'])
+            if resuming_from_best:
+                # Fresh optimizer avoids stale momentum pushing the model away from the good solution
+                param_groups = get_param_groups(model, args.lr) if use_single_pass else [p for p in model.parameters() if p.requires_grad]
+                optimizer = AdamW(param_groups, lr=args.lr, weight_decay=5e-4)
+                print('  Fresh optimizer (resuming from best)')
             try:
-                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                if not resuming_from_best:
+                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             except Exception:
                 print('  Warning: Optimizer state mismatch. Recreating optimizer...')
                 if use_single_pass:
@@ -968,7 +976,7 @@ def main():
                             progress = (epoch - _we) / max(1, _te - _we)
                             return 0.5 * (1 + math.cos(math.pi * progress))
                     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda_resume)
-            if 'scheduler_state_dict' in checkpoint:
+            if 'scheduler_state_dict' in checkpoint and not resuming_from_best:
                 try:
                     scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
                     print('  Loaded scheduler state')
@@ -990,9 +998,12 @@ def main():
             # Reset OneCycleLR for remaining epochs when resuming (avoids stuck high-LR after warmup)
             remaining_epochs = args.epochs - start_epoch
             if use_single_pass and start_epoch > 0 and not getattr(args, 'no_resume_reset_scheduler', False):
+                # Use 0.5x LR when resuming from best to avoid overshooting the good solution
+                lr_scale = 0.5 if resuming_from_best else 1.0
+                base_lr = args.lr * lr_scale
                 scheduler = torch.optim.lr_scheduler.OneCycleLR(
                     optimizer,
-                    max_lr=[args.lr, args.lr * 5, args.lr * 10],
+                    max_lr=[base_lr, base_lr * 5, base_lr * 10],
                     epochs=remaining_epochs,
                     steps_per_epoch=len(train_loader),
                     pct_start=0.1,
@@ -1000,7 +1011,8 @@ def main():
                     div_factor=10,
                     final_div_factor=100
                 )
-                print(f'  Recreated OneCycleLR for remaining {remaining_epochs} epochs (fresh warmup + decay)')
+                print(f'  Recreated OneCycleLR for remaining {remaining_epochs} epochs (fresh warmup + decay)' +
+                      (f', LR scale {lr_scale}x (resume from best)' if lr_scale != 1.0 else ''))
             best_map = checkpoint.get('best_map', 0.0)
             if scaler is not None and 'scaler_state_dict' in checkpoint:
                 scaler.load_state_dict(checkpoint['scaler_state_dict'])
