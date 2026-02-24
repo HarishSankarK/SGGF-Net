@@ -477,6 +477,10 @@ def main():
                        help='Resume from checkpoint (path to .pth file, or "latest" or "best" to auto-detect)')
     parser.add_argument('--auto_resume', action='store_true',
                        help='Automatically resume from latest.pth if it exists')
+    parser.add_argument('--resume_from_best', action='store_true',
+                       help='With --auto_resume: resume from best.pth instead of latest.pth (good when val mAP dropped)')
+    parser.add_argument('--no_resume_reset_scheduler', action='store_true',
+                       help='When resuming: keep saved scheduler state (default is to reset LR for remaining epochs)')
     parser.add_argument('--use_amp', action='store_true',
                        help='Use mixed precision training')
     parser.add_argument('--grad_clip', type=float, default=1.0,
@@ -768,8 +772,11 @@ def main():
     # When resuming, use backbone from checkpoint so model architecture matches
     _resume_path = None
     if args.auto_resume and args.resume is None:
+        best_cp = os.path.join(args.checkpoint_dir, 'best.pth')
         latest_cp = os.path.join(args.checkpoint_dir, 'latest.pth')
-        if os.path.exists(latest_cp):
+        if args.resume_from_best and os.path.exists(best_cp):
+            _resume_path = best_cp
+        elif os.path.exists(latest_cp):
             _resume_path = latest_cp
     elif args.resume:
         _resume_path = args.resume
@@ -902,10 +909,14 @@ def main():
     start_epoch = 0
     best_map = 0.0
     
-    # Auto-resume logic: if --auto_resume is set and latest.pth exists, use it
+    # Auto-resume logic: if --auto_resume is set, use latest.pth or best.pth
     if args.auto_resume and args.resume is None:
+        best_checkpoint = os.path.join(args.checkpoint_dir, 'best.pth')
         latest_checkpoint = os.path.join(args.checkpoint_dir, 'latest.pth')
-        if os.path.exists(latest_checkpoint):
+        if args.resume_from_best and os.path.exists(best_checkpoint):
+            args.resume = best_checkpoint
+            print(f'Auto-resuming from best: {best_checkpoint}')
+        elif os.path.exists(latest_checkpoint):
             args.resume = latest_checkpoint
             print(f'Auto-resuming from: {latest_checkpoint}')
     
@@ -960,13 +971,9 @@ def main():
             if 'scheduler_state_dict' in checkpoint:
                 try:
                     scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                    print('  Loaded scheduler state')
                 except Exception:
                     print('  Warning: Scheduler state mismatch, using fresh scheduler')
-                    if use_single_pass and start_epoch > 0:
-                        skip_steps = start_epoch * len(train_loader)
-                        print(f'  Fast-forwarding OneCycleLR by {skip_steps} steps...')
-                        for _ in range(skip_steps):
-                            scheduler.step()
             ckpt_stage = checkpoint.get('stage')
             ckpt_epoch = checkpoint.get('epoch', 0)
             ckpt_single_pass = checkpoint.get('single_pass', False)
@@ -980,6 +987,20 @@ def main():
             else:
                 start_epoch = 0
                 print(f'  Starting from epoch 1 (new mode or chaining stages)')
+            # Reset OneCycleLR for remaining epochs when resuming (avoids stuck high-LR after warmup)
+            remaining_epochs = args.epochs - start_epoch
+            if use_single_pass and start_epoch > 0 and not getattr(args, 'no_resume_reset_scheduler', False):
+                scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                    optimizer,
+                    max_lr=[args.lr, args.lr * 5, args.lr * 10],
+                    epochs=remaining_epochs,
+                    steps_per_epoch=len(train_loader),
+                    pct_start=0.1,
+                    anneal_strategy='cos',
+                    div_factor=10,
+                    final_div_factor=100
+                )
+                print(f'  Recreated OneCycleLR for remaining {remaining_epochs} epochs (fresh warmup + decay)')
             best_map = checkpoint.get('best_map', 0.0)
             if scaler is not None and 'scaler_state_dict' in checkpoint:
                 scaler.load_state_dict(checkpoint['scaler_state_dict'])
