@@ -1,0 +1,35 @@
+<annotation>
+  <size>
+    <width>640</width>
+    <height>512</height>
+    <depth>1</depth>
+  </size>
+  <segmented>0</segmented>
+  <object>
+    <name>person</name>
+    <pose>Unspecified</pose>
+    <truncated>0</truncated>
+    <point>
+      <x>225</x>
+      <y>348</y>
+    </point>
+  </object>
+  <object>
+    <name>person</name>
+    <pose>Unspecified</pose>
+    <truncated>0</truncated>
+    <point>
+      <x>90</x>
+      <y>493</y>
+    </point>
+  </object>
+  <object>
+    <name>person</name>
+    <pose>Unspecified</pose>
+    <truncated>0</truncated>
+    <point>
+      <x>75</x>
+      <y>497</y>
+    </point>
+  </object>
+</annotation>
