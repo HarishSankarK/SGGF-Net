@@ -441,8 +441,8 @@ def validate(model, dataloader, device, epoch, num_classes, conf_threshold=0.01)
 def main():
     parser = argparse.ArgumentParser(description='Train Fusion-YOLOv11')
     parser.add_argument('--dataset', type=str, default='dronergbt',
-                       choices=['dronergbt', 'hituav', 'smod', 'combined', 'combined_all'],
-                       help='Dataset: combined_all = HIT-UAV + DroneRGBT + SMOD in one cmd')
+                       choices=['dronergbt', 'hituav', 'smod', 'combined', 'combined_all', 'combined_rgbt_hituav'],
+                       help='Dataset: combined_rgbt_hituav = 100%% DroneRGBT + 100%% HIT-UAV (no SMOD)')
     parser.add_argument('--data_dir', type=str, 
                        default='sggf_net/data/dronergbt',
                        help='Dataset root directory (for single dataset)')
@@ -493,6 +493,8 @@ def main():
                        help='Max image size for resize (default 640 for Colab T4, use 1024/1536 if GPU has more memory)')
     parser.add_argument('--val_conf_threshold', type=float, default=0.01,
                        help='Confidence threshold for validation mAP (default 0.01 to capture early-training detections)')
+    parser.add_argument('--backbone', type=str, default='resnet50', choices=['resnet50', 'resnet101'],
+                       help='Backbone: resnet50 (default) or resnet101 (stronger, more params)')
     parser.add_argument('--laptop', action='store_true',
                        help='Laptop mode: batch_size=4, num_workers=2, use_amp=True for 4-6GB GPUs')
     
@@ -547,6 +549,8 @@ def main():
             args.num_classes = 3  # Combined: background + person + vehicle
         elif args.dataset == 'combined_all':
             args.num_classes = 3  # person + vehicle (HIT-UAV maps Car/Bicycle/OtherVehicle→vehicle, DontCare→skip)
+        elif args.dataset == 'combined_rgbt_hituav':
+            args.num_classes = 3  # person + vehicle (DroneRGBT + HIT-UAV, no SMOD)
         elif args.dataset == 'hituav':
             args.num_classes = 3  # HIT-UAV: person + vehicle (Person→person, Car/Bicycle/OtherVehicle→vehicle)
     
@@ -710,6 +714,26 @@ def main():
         val_dataset = ConcatDataset([hituav_val, dronergbt_val, smod_val])
         collate_fn = collate_fn_combined
         print(f"✓ Combined_all loaded: {len(hituav_train)} HIT-UAV + {len(dronergbt_train)} DroneRGBT + {len(smod_train)} SMOD = {len(train_dataset)} train")
+    elif args.dataset == 'combined_rgbt_hituav':
+        # DroneRGBT (100%) + HIT-UAV (100%) — no SMOD
+        print("Loading combined_rgbt_hituav (100% DroneRGBT + 100% HIT-UAV, no SMOD)...")
+        for name, path in [('HIT-UAV', args.hituav_dir), ('DroneRGBT', args.dronergbt_dir)]:
+            if not os.path.exists(path):
+                raise ValueError(f"{name} directory not found: {path}\nSee PREPROCESSING.md for setup.")
+        try:
+            hituav_train = HITUAVDataset(root_dir=args.hituav_dir, split='train', transform=train_transform, use_person_vehicle=True)
+            hituav_val = HITUAVDataset(root_dir=args.hituav_dir, split='val', transform=val_transform, use_person_vehicle=True)
+        except Exception as e:
+            raise ValueError(f"Failed to load HIT-UAV: {e}\nRun: python scripts/preprocess_hituav.py --help")
+        try:
+            dronergbt_train = DroneRGBTDataset(root_dir=args.dronergbt_dir, split='train', transform=train_transform)
+            dronergbt_val = DroneRGBTDataset(root_dir=args.dronergbt_dir, split='val', transform=val_transform)
+        except Exception as e:
+            raise ValueError(f"Failed to load DroneRGBT: {e}")
+        train_dataset = ConcatDataset([hituav_train, dronergbt_train])
+        val_dataset = ConcatDataset([hituav_val, dronergbt_val])
+        collate_fn = collate_fn_combined
+        print(f"✓ Combined (no SMOD): {len(hituav_train)} HIT-UAV + {len(dronergbt_train)} DroneRGBT = {len(train_dataset)} train")
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
     
@@ -741,13 +765,36 @@ def main():
     
     print(f'✓ DataLoader optimized: {args.num_workers} workers, prefetch={args.prefetch_factor}, pin_memory={pin_memory}')
     
+    # When resuming, use backbone from checkpoint so model architecture matches
+    _resume_path = None
+    if args.auto_resume and args.resume is None:
+        latest_cp = os.path.join(args.checkpoint_dir, 'latest.pth')
+        if os.path.exists(latest_cp):
+            _resume_path = latest_cp
+    elif args.resume:
+        _resume_path = args.resume
+        if _resume_path.lower() == 'latest':
+            _resume_path = os.path.join(args.checkpoint_dir, 'latest.pth')
+        elif _resume_path.lower() == 'best':
+            _resume_path = os.path.join(args.checkpoint_dir, 'best.pth')
+    if _resume_path and os.path.exists(_resume_path):
+        try:
+            _ckpt = torch.load(_resume_path, map_location='cpu', weights_only=False)
+        except TypeError:
+            _ckpt = torch.load(_resume_path, map_location='cpu')
+        if 'backbone' in _ckpt:
+            args.backbone = _ckpt['backbone']
+            print(f'✓ Resuming: using backbone from checkpoint ({args.backbone})')
+    
     # Create model
     model = FusionYOLOv11(
         num_classes=args.num_classes,
         pretrained=True,
-        fusion_type='concat_attention'
+        fusion_type='concat_attention',
+        backbone=args.backbone
     )
     model = model.to(device)
+    print(f'✓ Backbone: {args.backbone} (ImageNet-pretrained)')
     
     # Compile model for faster execution (PyTorch 2.0+)
     # DISABLED: torch.compile() is causing NaN losses with this model architecture
@@ -1011,7 +1058,8 @@ def main():
             'val_ap50': val_ap50,
             'args': vars(args),
             'stage': args.stage,
-            'single_pass': use_single_pass
+            'single_pass': use_single_pass,
+            'backbone': args.backbone
         }
         
         if scaler is not None:

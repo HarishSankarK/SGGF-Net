@@ -21,7 +21,7 @@ class DualStreamSGGFNet(nn.Module):
     """
     
     def __init__(self, pretrained=True, embed_dim=192, patch_size=32, 
-                 num_layers=3, num_heads=6):
+                 num_layers=3, num_heads=6, backbone='resnet50'):
         """
         Args:
             pretrained: Whether to use pretrained ResNet weights
@@ -29,6 +29,7 @@ class DualStreamSGGFNet(nn.Module):
             patch_size: GFEM patch size
             num_layers: Number of transformer layers in GFEM
             num_heads: Number of attention heads in GFEM
+            backbone: 'resnet50' or 'resnet101' (same C2–C5 channels, drop-in)
         """
         super(DualStreamSGGFNet, self).__init__()
         
@@ -37,7 +38,7 @@ class DualStreamSGGFNet(nn.Module):
             in_channels=3, embed_dim=embed_dim, patch_size=patch_size,
             num_layers=num_layers, num_heads=num_heads
         )
-        self.rgb_backbone = ResNetBackbone(pretrained=pretrained)
+        self.rgb_backbone = ResNetBackbone(pretrained=pretrained, backbone=backbone)
         self.rgb_fusion_conv = nn.Conv2d(embed_dim + 256, 256, kernel_size=1)
         
         # Thermal stream
@@ -45,7 +46,7 @@ class DualStreamSGGFNet(nn.Module):
             in_channels=3, embed_dim=embed_dim, patch_size=patch_size,
             num_layers=num_layers, num_heads=num_heads
         )
-        self.thermal_backbone = ResNetBackbone(pretrained=pretrained)
+        self.thermal_backbone = ResNetBackbone(pretrained=pretrained, backbone=backbone)
         self.thermal_fusion_conv = nn.Conv2d(embed_dim + 256, 256, kernel_size=1)
     
     def forward(self, rgb_images, thermal_images):
@@ -103,7 +104,7 @@ class FusionYOLOv11(nn.Module):
     
     def __init__(self, num_classes=80, pretrained=True, 
                  embed_dim=192, patch_size=32, num_layers=3, num_heads=6,
-                 fusion_type='concat_attention'):
+                 fusion_type='concat_attention', backbone='resnet50'):
         """
         Args:
             num_classes: Number of object classes
@@ -113,14 +114,16 @@ class FusionYOLOv11(nn.Module):
             num_layers: Number of transformer layers in GFEM
             num_heads: Number of attention heads in GFEM
             fusion_type: Fusion strategy ('concat', 'weighted', 'attention', 'concat_attention')
+            backbone: 'resnet50' or 'resnet101' (ImageNet-pretrained, same feature channels)
         """
         super(FusionYOLOv11, self).__init__()
         self.num_classes = num_classes
+        self.backbone_name = backbone
         
         # Dual-stream backbone
         self.dual_stream = DualStreamSGGFNet(
             pretrained=pretrained, embed_dim=embed_dim, patch_size=patch_size,
-            num_layers=num_layers, num_heads=num_heads
+            num_layers=num_layers, num_heads=num_heads, backbone=backbone
         )
         
         # Mid-level fusion modules for each scale (different channel sizes)

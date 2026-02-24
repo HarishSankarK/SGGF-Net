@@ -6,7 +6,7 @@ Full architecture with all components and real loss computation
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.models import resnet50
+from torchvision.models import resnet50, resnet101
 try:
     from torchvision.models._utils import IntermediateLayerGetter
 except ImportError:
@@ -22,20 +22,27 @@ from .anchor_utils import (
 
 
 class ResNetBackbone(nn.Module):
-    """ResNet50 backbone with feature extraction"""
+    """ResNet backbone with feature extraction (ResNet-50 or ResNet-101, same C2–C5 channels)."""
     
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, backbone='resnet50'):
         super(ResNetBackbone, self).__init__()
-        # Use weights parameter for newer torchvision versions
-        try:
-            from torchvision.models import ResNet50_Weights
-            weights = ResNet50_Weights.IMAGENET1K_V1 if pretrained else None
-            resnet = resnet50(weights=weights)
-        except ImportError:
-            # Fallback for older versions
-            resnet = resnet50(pretrained=pretrained)
+        backbone = backbone.lower()
+        if backbone == 'resnet101':
+            try:
+                from torchvision.models import ResNet101_Weights
+                weights = ResNet101_Weights.IMAGENET1K_V1 if pretrained else None
+                resnet = resnet101(weights=weights)
+            except ImportError:
+                resnet = resnet101(pretrained=pretrained)
+        else:
+            try:
+                from torchvision.models import ResNet50_Weights
+                weights = ResNet50_Weights.IMAGENET1K_V1 if pretrained else None
+                resnet = resnet50(weights=weights)
+            except ImportError:
+                resnet = resnet50(pretrained=pretrained)
         
-        # Extract intermediate layers
+        # Extract intermediate layers (same layout for 50 and 101: 256, 512, 1024, 2048)
         self.layer0 = nn.Sequential(
             resnet.conv1,
             resnet.bn1,

@@ -376,8 +376,9 @@ def main():
     dataset = SMODDataset(root_dir=args.data_dir, split=args.split, transform=transform)
     loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=collate_fn_single, num_workers=0)
     
-    model = FusionYOLOv11(num_classes=args.num_classes, pretrained=False, fusion_type='concat_attention')
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    backbone = ckpt.get('backbone', 'resnet50') if isinstance(ckpt, dict) else 'resnet50'
+    model = FusionYOLOv11(num_classes=args.num_classes, pretrained=False, fusion_type='concat_attention', backbone=backbone)
     model.load_state_dict(ckpt.get('ema_state_dict', ckpt['model_state_dict']))
     model = model.to(device).eval()
     

@@ -188,6 +188,8 @@ def main():
                        help='NMS IoU threshold')
     parser.add_argument('--max_size', type=int, default=640,
                        help='Max image size (default 640 for laptop/Colab GPUs)')
+    parser.add_argument('--backbone', type=str, default='resnet50', choices=['resnet50', 'resnet101'],
+                       help='Backbone (default: resnet50; overridden by checkpoint if saved)')
     parser.add_argument('--laptop', action='store_true',
                        help='Laptop mode: batch_size=2, max_size=640')
     parser.add_argument('--cpu', action='store_true',
@@ -275,15 +277,17 @@ def main():
         pin_memory=use_cuda
     )
     
-    # Create model
+    # Load checkpoint first to get backbone (so model architecture matches)
+    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    backbone = checkpoint.get('backbone', args.backbone) if isinstance(checkpoint, dict) else args.backbone
+    
+    # Create model with same backbone as checkpoint
     model = FusionYOLOv11(
         num_classes=args.num_classes,
         pretrained=False,
-        fusion_type='concat_attention'
+        fusion_type='concat_attention',
+        backbone=backbone
     )
-    
-    # Load checkpoint (prefer EMA weights from single-pass training)
-    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     if 'ema_state_dict' in checkpoint:
         model.load_state_dict(checkpoint['ema_state_dict'])
         print("Loaded EMA weights from checkpoint")
