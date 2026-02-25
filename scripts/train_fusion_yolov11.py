@@ -501,6 +501,8 @@ def main():
                        help='Backbone: resnet50 (default) or resnet101 (stronger, more params)')
     parser.add_argument('--laptop', action='store_true',
                        help='Laptop mode: batch_size=4, num_workers=2, use_amp=True for 4-6GB GPUs')
+    parser.add_argument('--early_stop_patience', type=int, default=15,
+                       help='Stop training if val mAP does not improve for N epochs (default 15, 0 to disable)')
     
     args = parser.parse_args()
     
@@ -793,9 +795,12 @@ def main():
             args.backbone = _ckpt['backbone']
             print(f'✓ Resuming: using backbone from checkpoint ({args.backbone})')
     
-    # Create model
+    # Model num_classes = number of foreground classes (head output channels)
+    # Datasets use 1-indexed labels (1=person, 2=vehicle). Head outputs 2 channels for 2 classes.
+    # Using 3 channels caused an unsupervised "ghost" class and hurt mAP.
+    model_num_classes = 2 if args.num_classes >= 3 else 1  # 2 for person+vehicle, 1 for person-only
     model = FusionYOLOv11(
-        num_classes=args.num_classes,
+        num_classes=model_num_classes,
         pretrained=True,
         fusion_type='concat_attention',
         backbone=args.backbone
@@ -940,10 +945,17 @@ def main():
             except TypeError:
                 checkpoint = torch.load(args.resume, map_location=device)
             # For EMA: load raw model weights for training, not the smoothed EMA weights
-            if use_single_pass and 'model_state_dict_raw' in checkpoint:
-                model.load_state_dict(checkpoint['model_state_dict_raw'])
-            else:
-                model.load_state_dict(checkpoint['model_state_dict'])
+            ckpt_sd = checkpoint['model_state_dict_raw'] if (use_single_pass and 'model_state_dict_raw' in checkpoint) else checkpoint['model_state_dict']
+            try:
+                model.load_state_dict(ckpt_sd, strict=True)
+            except Exception as e:
+                # Checkpoint may have different num_classes (e.g. old 3-class head). Load compatible parts only.
+                filtered = {k: ckpt_sd[k] for k in ckpt_sd if k in model.state_dict() and ckpt_sd[k].shape == model.state_dict()[k].shape}
+                if filtered:
+                    model.load_state_dict(filtered, strict=False)
+                    print('  Loaded compatible weights (detection head architecture changed, head re-initialized)')
+                else:
+                    raise e
             if resuming_from_best:
                 # Fresh optimizer avoids stale momentum pushing the model away from the good solution
                 param_groups = get_param_groups(model, args.lr) if use_single_pass else [p for p in model.parameters() if p.requires_grad]
@@ -1027,7 +1039,10 @@ def main():
     
     # Training loop
     print(f'Starting training for {args.epochs} epochs...')
+    if args.early_stop_patience > 0:
+        print(f'  Early stopping: patience={args.early_stop_patience} epochs (0 to disable)')
     log_path = os.path.join(args.checkpoint_dir, 'training_log.csv')
+    epochs_without_improvement = 0
     with open(log_path, 'w') as f:
         f.write('epoch,train_loss,val_map,val_ap50,val_ap25\n')
     if args.freeze_backbone and args.freeze_epochs:
@@ -1035,6 +1050,8 @@ def main():
         print(f'  Then unfreezing for remaining {args.epochs - args.freeze_epochs} epochs')
     
     for epoch in range(start_epoch, args.epochs):
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
         # Progressive unfreezing: unfreeze after freeze_epochs
         if args.freeze_backbone and args.freeze_epochs and epoch == args.freeze_epochs:
             print(f'\n🔄 Epoch {epoch+1}: Unfreezing all layers for fine-tuning...')
@@ -1092,7 +1109,8 @@ def main():
             'args': vars(args),
             'stage': args.stage,
             'single_pass': use_single_pass,
-            'backbone': args.backbone
+            'backbone': args.backbone,
+            'num_classes': model_num_classes,
         }
         
         if scaler is not None:
@@ -1109,10 +1127,17 @@ def main():
         # Save best checkpoint (only when mAP improves)
         if val_map > best_map:
             best_map = val_map
+            epochs_without_improvement = 0
             checkpoint['best_map'] = best_map
+            checkpoint['num_classes'] = model_num_classes  # for eval/inference
             best_path = os.path.join(args.checkpoint_dir, 'best.pth')
             torch.save(checkpoint, best_path)
             print(f'  ✓ Saved best model (mAP: {best_map:.4f}): {best_path}')
+        elif args.early_stop_patience > 0:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= args.early_stop_patience:
+                print(f'\n Early stopping: no mAP improvement for {args.early_stop_patience} epochs. Best mAP: {best_map:.4f}')
+                break
     
     print(f'Training completed! Best mAP: {best_map:.4f}')
     

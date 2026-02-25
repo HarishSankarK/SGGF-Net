@@ -65,10 +65,13 @@ def main():
     img_tensor, _ = transform(img_pil, target)
     H, W = img_tensor.shape[1], img_tensor.shape[2]
 
-    # Load checkpoint first to get backbone (so model architecture matches)
+    # Load checkpoint first to get backbone and num_classes (so model architecture matches)
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     backbone = ckpt.get('backbone', 'resnet50') if isinstance(ckpt, dict) else 'resnet50'
-    model = FusionYOLOv11(num_classes=args.num_classes, pretrained=False, fusion_type='concat_attention', backbone=backbone)
+    model_num_classes = ckpt.get('num_classes') if isinstance(ckpt, dict) else None
+    if model_num_classes is None:
+        model_num_classes = 2 if args.num_classes >= 3 else args.num_classes
+    model = FusionYOLOv11(num_classes=model_num_classes, pretrained=False, fusion_type='concat_attention', backbone=backbone)
     model.load_state_dict(ckpt.get('ema_state_dict', ckpt['model_state_dict']))
     model = model.to(device).eval()
 

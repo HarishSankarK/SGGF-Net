@@ -277,13 +277,17 @@ def main():
         pin_memory=use_cuda
     )
     
-    # Load checkpoint first to get backbone (so model architecture matches)
+    # Load checkpoint first to get backbone and num_classes (so model architecture matches)
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     backbone = checkpoint.get('backbone', args.backbone) if isinstance(checkpoint, dict) else args.backbone
+    # Model num_classes = foreground classes (2 for person+vehicle). Metrics use args.num_classes (3) to iterate classes 1,2
+    model_num_classes = checkpoint.get('num_classes') if isinstance(checkpoint, dict) else None
+    if model_num_classes is None:
+        model_num_classes = 2 if args.num_classes >= 3 else 1
     
-    # Create model with same backbone as checkpoint
+    # Create model with same backbone and num_classes as checkpoint
     model = FusionYOLOv11(
-        num_classes=args.num_classes,
+        num_classes=model_num_classes,
         pretrained=False,
         fusion_type='concat_attention',
         backbone=backbone

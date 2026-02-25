@@ -103,11 +103,25 @@ class Pad:
         return image, target
 
 
+class ColorJitterRGB:
+    """Color jitter for RGB (brightness/contrast) to reduce overfitting. Skips if image is not 3-channel."""
+    def __init__(self, brightness=0.15, contrast=0.15):
+        self.brightness = brightness
+        self.contrast = contrast
+    def __call__(self, image, target):
+        if isinstance(image, torch.Tensor) and image.shape[0] == 3:
+            b = 1 + (torch.rand(1).item() - 0.5) * 2 * self.brightness
+            c = 1 + (torch.rand(1).item() - 0.5) * 2 * self.contrast
+            image = (image * c + (b - 1)).clamp(0, 1)
+        return image, target
+
+
 def get_train_transform(max_size=640, multi_scale=False):
     """Get training transforms with data augmentation (default 640 for Colab T4 OOM avoidance)"""
     max_pad_size = max_size if not multi_scale else min(1536, max_size * 2)
     return Compose([
         ToTensor(),
+        ColorJitterRGB(brightness=0.15, contrast=0.15),
         RandomHorizontalFlip(prob=0.5),
         Resize(max_size=max_size, multi_scale=multi_scale),
         Pad(size=(max_pad_size, max_pad_size), fill=0)
