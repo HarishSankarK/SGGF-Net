@@ -977,6 +977,7 @@ def main():
                 checkpoint = torch.load(args.resume, map_location=device)
             # For EMA: load raw model weights for training, not the smoothed EMA weights
             ckpt_sd = checkpoint['model_state_dict_raw'] if (use_single_pass and 'model_state_dict_raw' in checkpoint) else checkpoint['model_state_dict']
+            head_reinit = False
             try:
                 model.load_state_dict(ckpt_sd, strict=True)
             except Exception as e:
@@ -984,6 +985,7 @@ def main():
                 filtered = {k: ckpt_sd[k] for k in ckpt_sd if k in model.state_dict() and ckpt_sd[k].shape == model.state_dict()[k].shape}
                 if filtered:
                     model.load_state_dict(filtered, strict=False)
+                    head_reinit = True
                     print('  Loaded compatible weights (detection head architecture changed, head re-initialized)')
                 else:
                     raise e
@@ -1060,9 +1062,12 @@ def main():
             if scaler is not None and 'scaler_state_dict' in checkpoint:
                 scaler.load_state_dict(checkpoint['scaler_state_dict'])
                 print('  Loaded scaler state')
-            if ema is not None and 'ema_state_dict' in checkpoint:
+            if ema is not None and 'ema_state_dict' in checkpoint and not head_reinit:
                 ema.load_state_dict(checkpoint['ema_state_dict'])
                 print('  Loaded EMA state')
+            elif ema is not None and head_reinit:
+                ema = ModelEMA(model, decay=0.9999)
+                print('  Reinitialized EMA (architecture changed, old EMA shapes incompatible)')
             elif ema is not None:
                 ema = ModelEMA(model, decay=0.9999)
             print(f'  Resumed: Best mAP so far: {best_map:.4f}')
