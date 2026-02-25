@@ -281,6 +281,17 @@ def unfreeze_all_layers(model):
     print('✓ Unfrozen all layers')
 
 
+def unfreeze_backbone_layer1(model):
+    """Unfreeze only backbone layer1 (keeps layer0 frozen) for progressive fine-tuning"""
+    for name, param in model.dual_stream.rgb_backbone.named_parameters():
+        if 'layer1' in name:
+            param.requires_grad = True
+    for name, param in model.dual_stream.thermal_backbone.named_parameters():
+        if 'layer1' in name:
+            param.requires_grad = True
+    print('✓ Unfrozen backbone layer1 (progressive fine-tuning)')
+
+
 def freeze_for_stage(model, stage):
     """
     Stage-by-stage training for FusionYOLOv11 (speeds up training).
@@ -457,6 +468,8 @@ def main():
                        help='HIT-UAV dataset directory (data/hit-uav or data/HIT-UAV)')
     parser.add_argument('--dronergbt_subset_ratio', type=float, default=1.0,
                        help='Use only this fraction of DroneRGBT (0.0-1.0). E.g. 0.5 for 50%%.')
+    parser.add_argument('--hituav_subset_ratio', type=float, default=1.0,
+                       help='Use only this fraction of HIT-UAV (0.0-1.0). E.g. 0.5 for 50%%.')
     parser.add_argument('--smod_subset_ratio', type=float, default=1.0,
                        help='Use only this fraction of SMOD (0.0-1.0). E.g. 0.25 for 25%%.')
     parser.add_argument('--num_classes', type=int, default=2,
@@ -503,6 +516,10 @@ def main():
                        help='Laptop mode: batch_size=4, num_workers=2, use_amp=True for 4-6GB GPUs')
     parser.add_argument('--early_stop_patience', type=int, default=15,
                        help='Stop training if val mAP does not improve for N epochs (default 15, 0 to disable)')
+    parser.add_argument('--unfreeze_layer1_epoch', type=int, default=0,
+                       help='Unfreeze backbone layer1 after this epoch (default 0=never)')
+    parser.add_argument('--multi_scale', action='store_true',
+                       help='Multi-scale training: random 512/640/768 for scale invariance')
     
     args = parser.parse_args()
     
@@ -542,7 +559,7 @@ def main():
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     
     # Load dataset (max_size 640 = Colab T4 safe, reduces OOM and speeds up training)
-    train_transform = get_train_transform(max_size=args.max_size)
+    train_transform = get_train_transform(max_size=args.max_size, multi_scale=args.multi_scale)
     val_transform = get_val_transform(max_size=args.max_size)
     
     # Set num_classes based on dataset if not explicitly provided
@@ -721,8 +738,8 @@ def main():
         collate_fn = collate_fn_combined
         print(f"✓ Combined_all loaded: {len(hituav_train)} HIT-UAV + {len(dronergbt_train)} DroneRGBT + {len(smod_train)} SMOD = {len(train_dataset)} train")
     elif args.dataset == 'combined_rgbt_hituav':
-        # DroneRGBT (100%) + HIT-UAV (100%) — no SMOD
-        print("Loading combined_rgbt_hituav (100% DroneRGBT + 100% HIT-UAV, no SMOD)...")
+        # DroneRGBT + HIT-UAV (no SMOD). Use --dronergbt_subset_ratio and --hituav_subset_ratio for subsets.
+        print("Loading combined_rgbt_hituav (DroneRGBT + HIT-UAV, no SMOD)...")
         for name, path in [('HIT-UAV', args.hituav_dir), ('DroneRGBT', args.dronergbt_dir)]:
             if not os.path.exists(path):
                 raise ValueError(f"{name} directory not found: {path}\nSee PREPROCESSING.md for setup.")
@@ -736,6 +753,20 @@ def main():
             dronergbt_val = DroneRGBTDataset(root_dir=args.dronergbt_dir, split='val', transform=val_transform)
         except Exception as e:
             raise ValueError(f"Failed to load DroneRGBT: {e}")
+        # Subset HIT-UAV if requested
+        if args.hituav_subset_ratio < 1.0:
+            rng = torch.Generator().manual_seed(42)
+            n_tr, n_v = len(hituav_train), len(hituav_val)
+            hituav_train = Subset(hituav_train, torch.randperm(n_tr, generator=rng)[:max(1, int(n_tr * args.hituav_subset_ratio))].tolist())
+            hituav_val = Subset(hituav_val, torch.randperm(n_v, generator=rng)[:max(1, int(n_v * args.hituav_subset_ratio))].tolist())
+            print(f"  HIT-UAV subset: {len(hituav_train)}/{n_tr} train, {len(hituav_val)}/{n_v} val ({args.hituav_subset_ratio*100:.0f}%)")
+        # Subset DroneRGBT if requested
+        if args.dronergbt_subset_ratio < 1.0:
+            rng = torch.Generator().manual_seed(43)
+            n_tr, n_v = len(dronergbt_train), len(dronergbt_val)
+            dronergbt_train = Subset(dronergbt_train, torch.randperm(n_tr, generator=rng)[:max(1, int(n_tr * args.dronergbt_subset_ratio))].tolist())
+            dronergbt_val = Subset(dronergbt_val, torch.randperm(n_v, generator=rng)[:max(1, int(n_v * args.dronergbt_subset_ratio))].tolist())
+            print(f"  DroneRGBT subset: {len(dronergbt_train)}/{n_tr} train, {len(dronergbt_val)}/{n_v} val ({args.dronergbt_subset_ratio*100:.0f}%)")
         train_dataset = ConcatDataset([hituav_train, dronergbt_train])
         val_dataset = ConcatDataset([hituav_val, dronergbt_val])
         collate_fn = collate_fn_combined
@@ -1052,7 +1083,20 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         if device.type == 'cuda':
             torch.cuda.empty_cache()
-        # Progressive unfreezing: unfreeze after freeze_epochs
+        # Progressive unfreezing: unfreeze layer1 after N epochs (single_pass mode)
+        if use_single_pass and args.unfreeze_layer1_epoch > 0 and epoch == args.unfreeze_layer1_epoch - 1:
+            unfreeze_backbone_layer1(model)
+            # Recreate optimizer to include newly unfrozen params (with lower LR for backbone)
+            param_groups = get_param_groups(model, args.lr)
+            optimizer = AdamW(param_groups, lr=args.lr, weight_decay=5e-4)
+            remaining_epochs = args.epochs - epoch - 1
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer, max_lr=[args.lr, args.lr * 5, args.lr * 10],
+                epochs=remaining_epochs, steps_per_epoch=len(train_loader),
+                pct_start=0.1, anneal_strategy='cos', div_factor=10, final_div_factor=100
+            )
+            print(f'  Recreated optimizer and OneCycleLR for {remaining_epochs} remaining epochs')
+        # Progressive unfreezing: unfreeze after freeze_epochs (legacy mode)
         if args.freeze_backbone and args.freeze_epochs and epoch == args.freeze_epochs:
             print(f'\n🔄 Epoch {epoch+1}: Unfreezing all layers for fine-tuning...')
             unfreeze_all_layers(model)

@@ -51,8 +51,8 @@ class Resize:
         self.max_size = max_size
         self.multi_scale = multi_scale
         if multi_scale:
-            # Multi-scale training: randomly sample from [1024, 1280, 1536]
-            self.scales = [1024, 1280, 1536]
+            # Multi-scale: sample from [0.8x, 1.0x, 1.2x] of max_size for scale invariance
+            self.scales = [int(max_size * 0.8), max_size, int(max_size * 1.2)]
     
     def __call__(self, image, target):
         h, w = image.shape[1], image.shape[2]

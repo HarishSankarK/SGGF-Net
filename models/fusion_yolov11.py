@@ -139,9 +139,9 @@ class FusionYOLOv11(nn.Module):
         # YOLOv11 detection head
         self.detection_head = YOLOv11Head(in_channels=256, num_classes=num_classes, num_anchors=1)
         
-        # Loss function (created once, not per forward pass)
+        # Loss function: higher bbox_weight (7.5) improves localization and mAP for small objects
         from .yolo_head import YOLOv11Loss
-        self.loss_fn = YOLOv11Loss(num_classes=num_classes)
+        self.loss_fn = YOLOv11Loss(num_classes=num_classes, bbox_weight=7.5)
     
     def forward(self, rgb_images, thermal_images, targets=None):
         """

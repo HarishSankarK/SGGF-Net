@@ -28,11 +28,12 @@ class YOLOv11Head(nn.Module):
         self.num_classes = num_classes
         self.num_anchors = num_anchors
         
-        # Shared convolution layers
+        # Shared convolution layers (dropout reduces overfitting)
         self.shared_conv = nn.Sequential(
             nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(in_channels),
             nn.SiLU(inplace=True),
+            nn.Dropout2d(0.1),
             nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(in_channels),
             nn.SiLU(inplace=True)
