@@ -15,7 +15,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from models import FusionYOLOv11
-from utils.dataset import DroneRGBTDataset, HITUAVDataset, SMODDataset
+from utils.dataset import DroneRGBTDataset, HITUAVDataset
 from utils.transforms import get_val_transform
 from utils.metrics import calculate_map, calculate_ap50, calculate_precision_recall_f1
 
@@ -37,7 +37,7 @@ def collate_fn_single(batch):
 
 def collate_fn_combined(batch):
     """
-    Custom collate function for combined dataset (DroneRGBT + SMOD)
+    Custom collate function for combined dataset (DroneRGBT + HIT-UAV)
     Handles both paired (RGB-Thermal) and single (RGB) data formats
     """
     rgb_images = []
@@ -45,14 +45,14 @@ def collate_fn_combined(batch):
     targets = []
     
     for item in batch:
-        # Check if it's paired data (DroneRGBT) or single data (SMOD)
+        # Check if it's paired data (DroneRGBT) or single data (HIT-UAV)
         if isinstance(item[0], tuple):
             # Paired RGB-Thermal data from DroneRGBT
             rgb_img, thermal_img = item[0]
             rgb_images.append(rgb_img)
             thermal_images.append(thermal_img)
         else:
-            # Single RGB data from SMOD - duplicate for thermal
+            # Single modality (e.g. HIT-UAV) - duplicate for thermal
             rgb_img = item[0]
             rgb_images.append(rgb_img)
             thermal_images.append(rgb_img)  # Use same image for thermal
@@ -159,7 +159,7 @@ def evaluate(model, dataloader, device, num_classes, conf_threshold=0.5, nms_thr
 def main():
     parser = argparse.ArgumentParser(description='Evaluate Fusion-YOLOv11')
     parser.add_argument('--dataset', type=str, default='dronergbt',
-                       choices=['dronergbt', 'hituav', 'smod', 'combined', 'combined_all'],
+                       choices=['dronergbt', 'hituav', 'combined_rgbt_hituav'],
                        help='Dataset to evaluate on')
     parser.add_argument('--data_dir', type=str, 
                        default='sggf_net/data/dronergbt',
@@ -167,16 +167,13 @@ def main():
     parser.add_argument('--dronergbt_dir', type=str,
                        default='sggf_net/data/DroneRGBT',
                        help='DroneRGBT dataset directory (for combined evaluation)')
-    parser.add_argument('--smod_dir', type=str,
-                       default='sggf_net/data/SMOD',
-                       help='SMOD dataset directory (for combined evaluation)')
     parser.add_argument('--hituav_dir', type=str,
                        default='data/hit-uav',
                        help='HIT-UAV dataset directory (data/hit-uav or data/HIT-UAV)')
     parser.add_argument('--checkpoint', type=str, required=True,
                        help='Path to model checkpoint')
     parser.add_argument('--num_classes', type=int, default=2,
-                       help='Number of classes (DroneRGBT: 2=background+person, SMOD: 3=background+person+vehicle, HIT-UAV: 6)')
+                       help='Number of classes (DroneRGBT: 2, HIT-UAV: 3)')
     parser.add_argument('--batch_size', type=int, default=4,
                        help='Batch size')
     parser.add_argument('--split', type=str, default='test',
@@ -214,14 +211,10 @@ def main():
     
     # Set num_classes based on dataset if not explicitly provided
     if args.num_classes == 2:  # Default value
-        if args.dataset == 'smod':
-            args.num_classes = 3  # SMOD: background + person + vehicle
-        elif args.dataset == 'dronergbt':
+        if args.dataset == 'dronergbt':
             args.num_classes = 2  # DroneRGBT: background + person
-        elif args.dataset == 'combined':
-            args.num_classes = 3  # Combined: background + person + vehicle
-        elif args.dataset == 'combined_all':
-            args.num_classes = 3  # person + vehicle (HIT-UAV remapped)
+        elif args.dataset == 'combined_rgbt_hituav':
+            args.num_classes = 3  # person + vehicle
         elif args.dataset == 'hituav':
             args.num_classes = 3  # HIT-UAV: person + vehicle
     
@@ -238,33 +231,12 @@ def main():
             root_dir=args.data_dir, split=args.split, transform=val_transform, use_person_vehicle=True
         )
         collate_fn = collate_fn_single
-    elif args.dataset == 'smod':
-        dataset = SMODDataset(
-            root_dir=args.data_dir, split=args.split, transform=val_transform
-        )
-        collate_fn = collate_fn_single
-    elif args.dataset == 'combined':
-        # Combined dataset: DroneRGBT + SMOD
-        print("Loading combined dataset (DroneRGBT + SMOD)...")
-        
-        dronergbt_dataset = DroneRGBTDataset(
-            root_dir=args.dronergbt_dir, split=args.split, transform=val_transform
-        )
-        smod_dataset = SMODDataset(
-            root_dir=args.smod_dir, split=args.split, transform=val_transform
-        )
-        
-        dataset = ConcatDataset([dronergbt_dataset, smod_dataset])
-        collate_fn = collate_fn_combined
-        
-        print(f"✓ Combined dataset loaded: {len(dronergbt_dataset)} DroneRGBT + {len(smod_dataset)} SMOD = {len(dataset)} total")
-    elif args.dataset == 'combined_all':
+    elif args.dataset == 'combined_rgbt_hituav':
         hituav_ds = HITUAVDataset(root_dir=args.hituav_dir, split=args.split, transform=val_transform, use_person_vehicle=True)
         dronergbt_ds = DroneRGBTDataset(root_dir=args.dronergbt_dir, split=args.split, transform=val_transform)
-        smod_ds = SMODDataset(root_dir=args.smod_dir, split=args.split, transform=val_transform)
-        dataset = ConcatDataset([hituav_ds, dronergbt_ds, smod_ds])
+        dataset = ConcatDataset([hituav_ds, dronergbt_ds])
         collate_fn = collate_fn_combined
-        print(f"✓ Combined_all loaded: {len(hituav_ds)} HIT-UAV + {len(dronergbt_ds)} DroneRGBT + {len(smod_ds)} SMOD = {len(dataset)} total")
+        print(f"✓ Combined loaded: {len(hituav_ds)} HIT-UAV + {len(dronergbt_ds)} DroneRGBT = {len(dataset)} total")
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
     

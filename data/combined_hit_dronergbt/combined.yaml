@@ -1,0 +1,8 @@
+path: data/combined_hit_dronergbt
+train: images/val
+val: images/val
+test: images/test
+names:
+  0: Person
+  1: Vehicle
+nc: 2

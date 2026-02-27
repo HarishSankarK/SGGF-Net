@@ -2,7 +2,7 @@
 
 **RGB-Thermal object detection for UAV/drone imagery** — Dual-stream SGGF-Net backbone with mid-level fusion and YOLOv11 detection head.
 
-- **Fusion-YOLOv11**: Primary implementation — trains on DroneRGBT (RGB-Thermal), SMOD (RGB), and HIT-UAV (thermal). Classes: **person**, **vehicle**.
+- **Fusion-YOLOv11**: Primary implementation — trains on DroneRGBT (RGB-Thermal) and HIT-UAV (thermal). Classes: **person**, **vehicle**.
 - **SGGF-Net**: Original single-modality Faster R-CNN variant (see `scripts/train.py`).
 
 ---
@@ -19,10 +19,9 @@
 ```bash
 # Training command (Colab cell)
 !python3 scripts/train_fusion_yolov11.py \
-  --dataset combined_all \
+  --dataset combined_rgbt_hituav \
   --hituav_dir data/hit-uav \
   --dronergbt_dir data/DroneRGBT \
-  --smod_dir data/SMOD \
   --checkpoint_dir /content/drive/MyDrive/FusionYOLOv11-checkpoints \
   --stage 1 --max_size 640 --batch_size 8 --num_workers 2
 ```
@@ -34,8 +33,8 @@
 pip install -r requirements.txt
 
 # Laptop mode (4–6GB): batch=4, AMP, max_size=640
-python scripts/train_fusion_yolov11.py --dataset combined_all --laptop \
-  --hituav_dir data/hit-uav --dronergbt_dir data/DroneRGBT --smod_dir data/SMOD \
+python scripts/train_fusion_yolov11.py --dataset combined_rgbt_hituav --laptop \
+  --hituav_dir data/hit-uav --dronergbt_dir data/DroneRGBT \
   --checkpoint_dir checkpoints --stage 1
 
 # 8GB+ GPU: omit --laptop (defaults: batch=8, max_size=640)
@@ -46,9 +45,6 @@ python scripts/train_fusion_yolov11.py --dataset combined_all --laptop \
 ```bash
 # DroneRGBT only (RGB-Thermal, person)
 python scripts/train_fusion_yolov11.py --dataset dronergbt --data_dir data/DroneRGBT --stage 1
-
-# SMOD only (RGB, person+vehicle)
-python scripts/train_fusion_yolov11.py --dataset smod --data_dir data/SMOD --stage 1
 
 # HIT-UAV only (thermal/infrared, person+vehicle)
 python scripts/train_fusion_yolov11.py --dataset hituav --data_dir data/hit-uav --stage 1
@@ -63,7 +59,6 @@ python scripts/train_fusion_yolov11.py --dataset hituav --data_dir data/hit-uav 
 | Dataset     | Modality      | Classes    | Structure                |
 |------------|---------------|------------|--------------------------|
 | **DroneRGBT** | RGB + Thermal | person     | `rgb/train`, `thermal/train`, `labels/train` |
-| **SMOD**   | RGB           | person, vehicle | `images/train`, `labels/train` (YOLO format) |
 | **HIT-UAV** | Thermal/Infrared | person, vehicle | `images/train`, `labels/train` (YOLO format) |
 
 ### Class Mapping (Unified 2-Class System)
@@ -79,12 +74,9 @@ data/
 ├── hit-uav/           # HIT-UAV (thermal)
 │   ├── images/train, val
 │   └── labels/train, val
-├── DroneRGBT/         # RGB-Thermal pairs
-│   ├── rgb/train, val
-│   ├── thermal/train, val
-│   └── labels/train, val
-└── SMOD/              # RGB
-    ├── images/train, val
+└── DroneRGBT/         # RGB-Thermal pairs
+    ├── rgb/train, val
+    ├── thermal/train, val
     └── labels/train, val
 ```
 
@@ -110,12 +102,13 @@ python scripts/preprocess_dronergbt.py --source data/DroneRGBT-raw --target data
 
 ### Dataset Modes
 
-| Mode           | Datasets                        | Default Ratios          |
-|----------------|----------------------------------|-------------------------|
-| `combined`     | DroneRGBT + SMOD                | 100% each               |
-| `combined_all` | HIT-UAV + DroneRGBT + SMOD      | 100% HIT, 50% DroneRGBT, 25% SMOD |
+| Mode                    | Datasets               | Default Ratios          |
+|-------------------------|------------------------|-------------------------|
+| `dronergbt`             | DroneRGBT only         | 100%                    |
+| `hituav`                | HIT-UAV only           | 100%                    |
+| `combined_rgbt_hituav`  | DroneRGBT + HIT-UAV    | 100% each (override with subset ratios) |
 
-Override ratios: `--dronergbt_subset_ratio 0.5 --smod_subset_ratio 0.25`
+Override ratios: `--dronergbt_subset_ratio 0.5 --hituav_subset_ratio 0.5`
 
 ### Stage-by-Stage Training (Recommended)
 
@@ -129,23 +122,23 @@ Chain stages:
 
 ```bash
 # Stage 1
-python scripts/train_fusion_yolov11.py --dataset combined_all --stage 1 \
-  --hituav_dir data/hit-uav --dronergbt_dir data/DroneRGBT --smod_dir data/SMOD
+python scripts/train_fusion_yolov11.py --dataset combined_rgbt_hituav --stage 1 \
+  --hituav_dir data/hit-uav --dronergbt_dir data/DroneRGBT
 
 # Stage 2
 python scripts/train_fusion_yolov11.py --stage 2 --resume checkpoints/best.pth \
-  --dataset combined_all --hituav_dir data/hit-uav --dronergbt_dir data/DroneRGBT --smod_dir data/SMOD
+  --dataset combined_rgbt_hituav --hituav_dir data/hit-uav --dronergbt_dir data/DroneRGBT
 
 # Stage 3
 python scripts/train_fusion_yolov11.py --stage 3 --resume checkpoints/best.pth \
-  --dataset combined_all --hituav_dir data/hit-uav --dronergbt_dir data/DroneRGBT --smod_dir data/SMOD
+  --dataset combined_rgbt_hituav --hituav_dir data/hit-uav --dronergbt_dir data/DroneRGBT
 ```
 
 ### Key Arguments
 
 | Argument              | Default | Description                          |
 |-----------------------|---------|--------------------------------------|
-| `--dataset`           | dronergbt | dronergbt, hituav, smod, combined, combined_all |
+| `--dataset`           | dronergbt | dronergbt, hituav, combined_rgbt_hituav |
 | `--stage`             | None    | 1, 2, 3 for stage-wise training      |
 | `--batch_size`        | 8       | Reduce for low VRAM                 |
 | `--max_size`          | 640     | Image resize max (Colab: 640)        |
@@ -162,9 +155,9 @@ python scripts/train_fusion_yolov11.py --stage 3 --resume checkpoints/best.pth \
 **Validation:**
 ```bash
 python scripts/evaluate_fusion.py \
-  --dataset smod \
-  --data_dir data/SMOD \
-  --checkpoint checkpoints_smod_fresh/best.pth \
+  --dataset hituav \
+  --data_dir data/hit-uav \
+  --checkpoint checkpoints/best.pth \
   --num_classes 3 \
   --split val
 ```
@@ -172,16 +165,16 @@ python scripts/evaluate_fusion.py \
 **Test:**
 ```bash
 python scripts/evaluate_fusion.py \
-  --dataset smod \
-  --data_dir data/SMOD \
-  --checkpoint checkpoints_smod_fresh/best.pth \
+  --dataset hituav \
+  --data_dir data/hit-uav \
+  --checkpoint checkpoints/best.pth \
   --num_classes 3 \
   --split test
 ```
 
 For low-VRAM GPUs: `--laptop`. For CPU-only: `--cpu`.
 
-**Combined/other datasets:** Use `--dataset combined_all` with `--hituav_dir`, `--dronergbt_dir`, `--smod_dir` as needed.
+**Combined dataset:** Use `--dataset combined_rgbt_hituav` with `--hituav_dir` and `--dronergbt_dir`.
 
 ### Figure Generation (for manuscript)
 
@@ -189,9 +182,9 @@ Generates PR curves, confusion matrix, mAP vs IoU, metrics bar chart, detection 
 
 ```bash
 python scripts/generate_eval_figures.py \
-  --dataset smod \
-  --data_dir data/SMOD \
-  --checkpoint checkpoints_smod_fresh/best.pth \
+  --dataset hituav \
+  --data_dir data/hit-uav \
+  --checkpoint checkpoints/best.pth \
   --output_dir ../Paper/figures \
   --split val
 ```
@@ -209,7 +202,7 @@ For test split: `--split test`. Training curves use `training_log.csv` (auto-det
 3. **PANet** — Multi-scale feature aggregation
 4. **YOLOv11 head** — Anchor-free detection (objectness + bbox + class logits)
 
-Single-modality input (e.g. HIT-UAV, SMOD): RGB image duplicated as both RGB and thermal streams.
+Single-modality input (e.g. HIT-UAV thermal): Thermal image duplicated as both RGB and thermal streams for compatibility.
 
 ---
 
@@ -235,7 +228,7 @@ sggf_net/
 │   ├── sggf_net.py         # ResNet backbone, legacy SGGF-Net
 │   └── ...
 ├── utils/
-│   ├── dataset.py          # DroneRGBTDataset, HITUAVDataset, SMODDataset
+│   ├── dataset.py          # DroneRGBTDataset, HITUAVDataset
 │   ├── transforms.py       # Resize, Pad, RandomHorizontalFlip
 │   └── metrics.py          # mAP, AP50, IoU
 ├── scripts/
@@ -244,10 +237,9 @@ sggf_net/
 │   ├── generate_eval_figures.py  # PR curves, confusion matrix, etc.
 │   ├── preprocess_hituav.py      # HIT-UAV preprocessing
 │   ├── preprocess_dronergbt.py   # DroneRGBT preprocessing
-│   ├── preprocess_smod.py       # SMOD preprocessing
 │   ├── train.py                  # Legacy SGGF-Net (HIT-UAV)
 │   └── evaluate.py               # Legacy evaluation
-├── data/                   # Datasets (hit-uav, DroneRGBT, SMOD)
+├── data/                   # Datasets (hit-uav, DroneRGBT)
 ├── requirements.txt
 └── README.md
 ```

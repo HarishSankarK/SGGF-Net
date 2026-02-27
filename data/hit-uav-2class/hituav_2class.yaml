@@ -1,0 +1,10 @@
+# YOLOv8 data config for HIT-UAV (2 classes: Person, Vehicle)
+# Run: python scripts/remap_hituav_to_2class.py first
+path: data/hit-uav-2class
+train: images/train
+val: images/val
+test: images/test
+names:
+  0: Person
+  1: Vehicle
+nc: 2

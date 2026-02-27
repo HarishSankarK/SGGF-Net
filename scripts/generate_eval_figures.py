@@ -2,8 +2,8 @@
 Generate evaluation figures for manuscript: PR curves, confusion matrix, mAP vs IoU,
 metrics bar chart, detection examples, and training curves.
 Usage:
-  python scripts/generate_eval_figures.py --dataset smod --data_dir data/SMOD \
-    --checkpoint checkpoints_smod_fresh/best.pth --output_dir ../Paper/figures
+  python scripts/generate_eval_figures.py --dataset hituav --data_dir data/hit-uav \
+    --checkpoint checkpoints/best.pth --output_dir ../Paper/figures
 """
 
 import os
@@ -22,14 +22,14 @@ import torchvision.transforms.functional as F_tf
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from models import FusionYOLOv11
-from utils.dataset import SMODDataset, DroneRGBTDataset, HITUAVDataset
+from utils.dataset import DroneRGBTDataset, HITUAVDataset
 from utils.transforms import get_val_transform
 from utils.metrics import (
     calculate_map, calculate_ap, calculate_ap50, calculate_precision_recall_f1,
     calculate_iou, get_precision_recall_curves
 )
 
-# Class names for SMOD (1=person, 2=vehicle)
+# Class names (1=person, 2=vehicle)
 CLASS_NAMES = {1: 'Person', 2: 'Vehicle'}
 COLORS = {1: (0, 255, 0), 2: (0, 0, 255)}  # Green, Blue for drawing
 
@@ -352,8 +352,8 @@ def plot_training_curves(log_path, output_path):
 
 def main():
     parser = argparse.ArgumentParser(description='Generate evaluation figures for manuscript')
-    parser.add_argument('--dataset', type=str, default='smod')
-    parser.add_argument('--data_dir', type=str, default='data/SMOD')
+    parser.add_argument('--dataset', type=str, default='hituav', choices=['hituav', 'dronergbt'])
+    parser.add_argument('--data_dir', type=str, default='data/hit-uav')
     parser.add_argument('--checkpoint', type=str, required=True)
     parser.add_argument('--output_dir', type=str, default='../Paper/figures')
     parser.add_argument('--split', type=str, default='val', choices=['train', 'val', 'test'])
@@ -373,8 +373,19 @@ def main():
     
     print('Loading model and dataset...')
     transform = get_val_transform(max_size=640)
-    dataset = SMODDataset(root_dir=args.data_dir, split=args.split, transform=transform)
-    loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=collate_fn_single, num_workers=0)
+    if args.dataset == 'hituav':
+        dataset = HITUAVDataset(root_dir=args.data_dir, split=args.split, transform=transform, use_person_vehicle=True)
+        collate_fn = collate_fn_single
+    elif args.dataset == 'dronergbt':
+        dataset = DroneRGBTDataset(root_dir=args.data_dir, split=args.split, transform=transform)
+        def _collate_dronergbt(batch):
+            images = [item[0][0] for item in batch]
+            targets = [item[1] for item in batch]
+            return images, targets
+        collate_fn = _collate_dronergbt
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset}. Use hituav or dronergbt.")
+    loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=collate_fn, num_workers=0)
     
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     backbone = ckpt.get('backbone', 'resnet50') if isinstance(ckpt, dict) else 'resnet50'

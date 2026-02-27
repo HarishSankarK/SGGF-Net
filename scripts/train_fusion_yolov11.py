@@ -19,7 +19,7 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from models import FusionYOLOv11
-from utils.dataset import DroneRGBTDataset, HITUAVDataset, SMODDataset
+from utils.dataset import DroneRGBTDataset, HITUAVDataset
 from utils.transforms import get_train_transform, get_val_transform
 from utils.metrics import calculate_map, calculate_ap50
 
@@ -41,7 +41,7 @@ def collate_fn_single(batch):
 
 def collate_fn_combined(batch):
     """
-    Custom collate function for combined dataset (DroneRGBT + SMOD)
+    Custom collate function for combined dataset (DroneRGBT + HIT-UAV)
     Handles both paired (RGB-Thermal) and single (RGB) data formats
     """
     rgb_images = []
@@ -49,14 +49,14 @@ def collate_fn_combined(batch):
     targets = []
     
     for item in batch:
-        # Check if it's paired data (DroneRGBT) or single data (SMOD)
+        # Check if it's paired data (DroneRGBT) or single data (HIT-UAV)
         if isinstance(item[0], tuple):
             # Paired RGB-Thermal data from DroneRGBT
             rgb_img, thermal_img = item[0]
             rgb_images.append(rgb_img)
             thermal_images.append(thermal_img)
         else:
-            # Single RGB data from SMOD - duplicate for thermal
+            # Single modality (e.g. HIT-UAV) - duplicate for thermal
             rgb_img = item[0]
             rgb_images.append(rgb_img)
             thermal_images.append(rgb_img)  # Use same image for thermal
@@ -105,7 +105,7 @@ def train_one_epoch(model, dataloader, optimizer, device, epoch, scaler=None, us
             targets = [{k: v.to(device, non_blocking=True) for k, v in t.items()} for t in targets]
             
             # For single modality, use same image for both RGB and Thermal
-            # (This allows training on HIT-UAV or SMOD alone)
+            # (This allows training on HIT-UAV alone)
             thermal_images = images
             
             optimizer.zero_grad()
@@ -452,17 +452,14 @@ def validate(model, dataloader, device, epoch, num_classes, conf_threshold=0.01)
 def main():
     parser = argparse.ArgumentParser(description='Train Fusion-YOLOv11')
     parser.add_argument('--dataset', type=str, default='dronergbt',
-                       choices=['dronergbt', 'hituav', 'smod', 'combined', 'combined_all', 'combined_rgbt_hituav'],
-                       help='Dataset: combined_rgbt_hituav = 100%% DroneRGBT + 100%% HIT-UAV (no SMOD)')
+                       choices=['dronergbt', 'hituav', 'combined_rgbt_hituav'],
+                       help='Dataset: combined_rgbt_hituav = DroneRGBT + HIT-UAV')
     parser.add_argument('--data_dir', type=str, 
                        default='sggf_net/data/dronergbt',
                        help='Dataset root directory (for single dataset)')
     parser.add_argument('--dronergbt_dir', type=str,
                        default='sggf_net/data/DroneRGBT',
                        help='DroneRGBT dataset directory (for combined training)')
-    parser.add_argument('--smod_dir', type=str,
-                       default='sggf_net/data/SMOD',
-                       help='SMOD dataset directory (for combined training)')
     parser.add_argument('--hituav_dir', type=str,
                        default='data/hit-uav',
                        help='HIT-UAV dataset directory (data/hit-uav or data/HIT-UAV)')
@@ -470,10 +467,8 @@ def main():
                        help='Use only this fraction of DroneRGBT (0.0-1.0). E.g. 0.5 for 50%%.')
     parser.add_argument('--hituav_subset_ratio', type=float, default=1.0,
                        help='Use only this fraction of HIT-UAV (0.0-1.0). E.g. 0.5 for 50%%.')
-    parser.add_argument('--smod_subset_ratio', type=float, default=1.0,
-                       help='Use only this fraction of SMOD (0.0-1.0). E.g. 0.25 for 25%%.')
     parser.add_argument('--num_classes', type=int, default=2,
-                       help='Number of classes (DroneRGBT: 2=background+person, SMOD: 3=background+person+vehicle, HIT-UAV: 6)')
+                       help='Number of classes (DroneRGBT: 2, HIT-UAV: 3 person+vehicle)')
     parser.add_argument('--checkpoint_dir', type=str, default='sggf_net/checkpoints',
                        help='Checkpoint directory')
     parser.add_argument('--batch_size', type=int, default=8,
@@ -535,14 +530,6 @@ def main():
             args.max_size = 640
         print('✓ Laptop mode: batch_size=4, num_workers=2, use_amp=True (override with explicit args)')
     
-    # combined_all defaults: 100% HIT-UAV, 50% DroneRGBT, 25% SMOD (override defaults if not explicitly set)
-    argv_str = ' '.join(sys.argv)
-    if args.dataset == 'combined_all':
-        if '--dronergbt_subset_ratio' not in argv_str:
-            args.dronergbt_subset_ratio = 0.5
-        if '--smod_subset_ratio' not in argv_str:
-            args.smod_subset_ratio = 0.25
-    
     # Device setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
@@ -564,14 +551,8 @@ def main():
     
     # Set num_classes based on dataset if not explicitly provided
     if args.num_classes == 2:  # Default value
-        if args.dataset == 'smod':
-            args.num_classes = 3  # SMOD: background + person + vehicle
-        elif args.dataset == 'dronergbt':
+        if args.dataset == 'dronergbt':
             args.num_classes = 2  # DroneRGBT: background + person
-        elif args.dataset == 'combined':
-            args.num_classes = 3  # Combined: background + person + vehicle
-        elif args.dataset == 'combined_all':
-            args.num_classes = 3  # person + vehicle (HIT-UAV maps Car/Bicycle/OtherVehicle→vehicle, DontCare→skip)
         elif args.dataset == 'combined_rgbt_hituav':
             args.num_classes = 3  # person + vehicle (DroneRGBT + HIT-UAV, no SMOD)
         elif args.dataset == 'hituav':
@@ -595,151 +576,9 @@ def main():
             root_dir=hituav_root, split='val', transform=val_transform, use_person_vehicle=True
         )
         collate_fn = collate_fn_single
-    elif args.dataset == 'smod':
-        smod_root = args.smod_dir
-        print(f"Loading SMOD dataset from: {smod_root}")
-        train_dataset = SMODDataset(
-            root_dir=smod_root, split='train', transform=train_transform
-        )
-        val_dataset = SMODDataset(
-            root_dir=smod_root, split='val', transform=val_transform
-        )
-        if args.smod_subset_ratio < 1.0:
-            rng = torch.Generator().manual_seed(42)
-            n_train = len(train_dataset)
-            n_val = len(val_dataset)
-            keep_train = max(1, int(n_train * args.smod_subset_ratio))
-            keep_val = max(1, int(n_val * args.smod_subset_ratio))
-            train_dataset = Subset(train_dataset, torch.randperm(n_train, generator=rng)[:keep_train].tolist())
-            val_dataset = Subset(val_dataset, torch.randperm(n_val, generator=rng)[:keep_val].tolist())
-            print(f"SMOD subset: {keep_train}/{n_train} train, {keep_val}/{n_val} val ({args.smod_subset_ratio*100:.0f}%)")
-        collate_fn = collate_fn_single
-    elif args.dataset == 'combined':
-        # Combined dataset: DroneRGBT + SMOD
-        print("Loading combined dataset (DroneRGBT + SMOD)...")
-        
-        # Check if directories exist
-        if not os.path.exists(args.dronergbt_dir):
-            raise ValueError(f"DroneRGBT directory not found: {args.dronergbt_dir}\n"
-                           f"Please ensure DroneRGBT dataset is preprocessed and exists at this path.")
-        
-        if not os.path.exists(args.smod_dir):
-            raise ValueError(f"SMOD directory not found: {args.smod_dir}\n"
-                           f"Please ensure SMOD dataset exists at this path.\n"
-                           f"Expected structure:\n"
-                           f"  {args.smod_dir}/\n"
-                           f"    ├── images/\n"
-                           f"    │   ├── train/\n"
-                           f"    │   ├── val/\n"
-                           f"    │   └── test/\n"
-                           f"    └── labels/\n"
-                           f"        ├── train/\n"
-                           f"        ├── val/\n"
-                           f"        └── test/\n"
-                           f"\nIf you only want to train on DroneRGBT, use:\n"
-                           f"  --dataset dronergbt --data_dir {args.dronergbt_dir}")
-        
-        # Load DroneRGBT dataset
-        try:
-            dronergbt_train = DroneRGBTDataset(
-                root_dir=args.dronergbt_dir, split='train', transform=train_transform
-            )
-            dronergbt_val = DroneRGBTDataset(
-                root_dir=args.dronergbt_dir, split='val', transform=val_transform
-            )
-        except Exception as e:
-            raise ValueError(f"Failed to load DroneRGBT dataset: {e}\n"
-                           f"Please ensure DroneRGBT dataset is preprocessed correctly.")
-        
-        # Optionally use only a subset of DroneRGBT
-        if args.dronergbt_subset_ratio < 1.0:
-            rng = torch.Generator().manual_seed(42)
-            n_train = len(dronergbt_train)
-            n_val = len(dronergbt_val)
-            keep_train = max(1, int(n_train * args.dronergbt_subset_ratio))
-            keep_val = max(1, int(n_val * args.dronergbt_subset_ratio))
-            idx_train = torch.randperm(n_train, generator=rng)[:keep_train].tolist()
-            idx_val = torch.randperm(n_val, generator=rng)[:keep_val].tolist()
-            dronergbt_train = Subset(dronergbt_train, idx_train)
-            dronergbt_val = Subset(dronergbt_val, idx_val)
-            print(f"  DroneRGBT subset: {keep_train}/{n_train} train, {keep_val}/{n_val} val ({args.dronergbt_subset_ratio*100:.0f}%)")
-        
-        # Load SMOD dataset
-        try:
-            smod_train = SMODDataset(
-                root_dir=args.smod_dir, split='train', transform=train_transform
-            )
-            smod_val = SMODDataset(
-                root_dir=args.smod_dir, split='val', transform=val_transform
-            )
-        except Exception as e:
-            raise ValueError(f"Failed to load SMOD dataset: {e}\n"
-                           f"Please ensure SMOD dataset structure is correct.\n"
-                           f"Expected: {args.smod_dir}/images/train/ and {args.smod_dir}/labels/train/")
-        
-        # Optionally use only a subset of SMOD (for faster training)
-        if args.smod_subset_ratio < 1.0:
-            rng = torch.Generator().manual_seed(42)
-            n_train = len(smod_train)
-            n_val = len(smod_val)
-            keep_train = max(1, int(n_train * args.smod_subset_ratio))
-            keep_val = max(1, int(n_val * args.smod_subset_ratio))
-            idx_train = torch.randperm(n_train, generator=rng)[:keep_train].tolist()
-            idx_val = torch.randperm(n_val, generator=rng)[:keep_val].tolist()
-            smod_train = Subset(smod_train, idx_train)
-            smod_val = Subset(smod_val, idx_val)
-            print(f"  SMOD subset: {keep_train}/{n_train} train, {keep_val}/{n_val} val ({args.smod_subset_ratio*100:.0f}%)")
-        
-        # Concatenate datasets
-        train_dataset = ConcatDataset([dronergbt_train, smod_train])
-        val_dataset = ConcatDataset([dronergbt_val, smod_val])
-        
-        collate_fn = collate_fn_combined
-        
-        print(f"✓ Combined dataset loaded:")
-        print(f"  Train: {len(dronergbt_train)} DroneRGBT + {len(smod_train)} SMOD = {len(train_dataset)} total")
-        print(f"  Val: {len(dronergbt_val)} DroneRGBT + {len(smod_val)} SMOD = {len(val_dataset)} total")
-    elif args.dataset == 'combined_all':
-        # Combined_all: full HIT-UAV + 50% DroneRGBT + 25% SMOD (or custom ratios via args)
-        print("Loading combined_all dataset (HIT-UAV + DroneRGBT + SMOD)...")
-        for name, path in [('HIT-UAV', args.hituav_dir), ('DroneRGBT', args.dronergbt_dir), ('SMOD', args.smod_dir)]:
-            if not os.path.exists(path):
-                raise ValueError(f"{name} directory not found: {path}\nSee PREPROCESSING.md for setup.")
-        
-        # Load HIT-UAV (full)
-        try:
-            hituav_train = HITUAVDataset(root_dir=args.hituav_dir, split='train', transform=train_transform, use_person_vehicle=True)
-            hituav_val = HITUAVDataset(root_dir=args.hituav_dir, split='val', transform=val_transform, use_person_vehicle=True)
-        except Exception as e:
-            raise ValueError(f"Failed to load HIT-UAV: {e}\nRun: python scripts/preprocess_hituav.py --help")
-        
-        # Load DroneRGBT with subset
-        dronergbt_train = DroneRGBTDataset(root_dir=args.dronergbt_dir, split='train', transform=train_transform)
-        dronergbt_val = DroneRGBTDataset(root_dir=args.dronergbt_dir, split='val', transform=val_transform)
-        if args.dronergbt_subset_ratio < 1.0:
-            rng = torch.Generator().manual_seed(42)
-            n_tr, n_v = len(dronergbt_train), len(dronergbt_val)
-            dronergbt_train = Subset(dronergbt_train, torch.randperm(n_tr, generator=rng)[:max(1, int(n_tr * args.dronergbt_subset_ratio))].tolist())
-            dronergbt_val = Subset(dronergbt_val, torch.randperm(n_v, generator=rng)[:max(1, int(n_v * args.dronergbt_subset_ratio))].tolist())
-            print(f"  DroneRGBT subset: {len(dronergbt_train)}/{n_tr} train ({args.dronergbt_subset_ratio*100:.0f}%)")
-        
-        # Load SMOD with subset
-        smod_train = SMODDataset(root_dir=args.smod_dir, split='train', transform=train_transform)
-        smod_val = SMODDataset(root_dir=args.smod_dir, split='val', transform=val_transform)
-        if args.smod_subset_ratio < 1.0:
-            rng = torch.Generator().manual_seed(42)
-            n_tr, n_v = len(smod_train), len(smod_val)
-            smod_train = Subset(smod_train, torch.randperm(n_tr, generator=rng)[:max(1, int(n_tr * args.smod_subset_ratio))].tolist())
-            smod_val = Subset(smod_val, torch.randperm(n_v, generator=rng)[:max(1, int(n_v * args.smod_subset_ratio))].tolist())
-            print(f"  SMOD subset: {len(smod_train)}/{n_tr} train ({args.smod_subset_ratio*100:.0f}%)")
-        
-        train_dataset = ConcatDataset([hituav_train, dronergbt_train, smod_train])
-        val_dataset = ConcatDataset([hituav_val, dronergbt_val, smod_val])
-        collate_fn = collate_fn_combined
-        print(f"✓ Combined_all loaded: {len(hituav_train)} HIT-UAV + {len(dronergbt_train)} DroneRGBT + {len(smod_train)} SMOD = {len(train_dataset)} train")
     elif args.dataset == 'combined_rgbt_hituav':
         # DroneRGBT + HIT-UAV (no SMOD). Use --dronergbt_subset_ratio and --hituav_subset_ratio for subsets.
-        print("Loading combined_rgbt_hituav (DroneRGBT + HIT-UAV, no SMOD)...")
+        print("Loading combined_rgbt_hituav (DroneRGBT + HIT-UAV)...")
         for name, path in [('HIT-UAV', args.hituav_dir), ('DroneRGBT', args.dronergbt_dir)]:
             if not os.path.exists(path):
                 raise ValueError(f"{name} directory not found: {path}\nSee PREPROCESSING.md for setup.")
@@ -770,7 +609,7 @@ def main():
         train_dataset = ConcatDataset([hituav_train, dronergbt_train])
         val_dataset = ConcatDataset([hituav_val, dronergbt_val])
         collate_fn = collate_fn_combined
-        print(f"✓ Combined (no SMOD): {len(hituav_train)} HIT-UAV + {len(dronergbt_train)} DroneRGBT = {len(train_dataset)} train")
+        print(f"✓ Combined: {len(hituav_train)} HIT-UAV + {len(dronergbt_train)} DroneRGBT = {len(train_dataset)} train")
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
     
@@ -1195,7 +1034,7 @@ def main():
         next_stage = args.stage + 1
         best_path = os.path.join(args.checkpoint_dir, 'best.pth')
         print(f'\n💡 To continue with Stage {next_stage}, run:')
-        extra = f'--dataset {args.dataset} --dronergbt_dir {args.dronergbt_dir} --smod_dir {args.smod_dir}'
+        extra = f'--dataset {args.dataset} --dronergbt_dir {args.dronergbt_dir} --hituav_dir {args.hituav_dir}'
         if args.dataset == 'combined_all':
             extra += f' --hituav_dir {args.hituav_dir}'
         print(f'   python scripts/train_fusion_yolov11.py --stage {next_stage} --resume {best_path} {extra}')

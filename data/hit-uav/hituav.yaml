@@ -1,0 +1,12 @@
+# YOLOv8 data config for HIT-UAV (from sggf_net/)
+path: data/hit-uav
+train: images/train
+val: images/val
+test: images/test
+names:
+  0: Person
+  1: Car
+  2: Bicycle
+  3: OtherVehicle
+  4: DontCare
+nc: 5

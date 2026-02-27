@@ -1,0 +1,6 @@
+Model: HIT_plus_DroneRGBT_FINAL/weights/best.pt
+Data: data/combined_hit_dronergbt/combined.yaml split=val
+mAP50: 0.3406
+mAP50-95: 0.2047
+Precision: 0.3410
+Recall: 0.3553
