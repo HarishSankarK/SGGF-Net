@@ -1,0 +1,12 @@
+# YOLOv11 data config for DroneRGBT (RGB stream, 1 class: Person)
+# Run preprocess_dronergbt.py first to prepare the dataset
+# RGB images used for standard single-stream YOLOv11 training
+
+path: data/dronergbt
+train: rgb/train
+val: rgb/val
+test: rgb/test
+
+nc: 1
+names:
+  0: Person

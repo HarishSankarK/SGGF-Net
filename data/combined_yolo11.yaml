@@ -1,0 +1,27 @@
+# YOLOv11 combined dataset config: HIT-UAV + DroneRGBT
+# Unified 2-class system: Person (0), Vehicle (1)
+# DroneRGBT labels only contain class 0 (Person) — compatible
+# HIT-UAV 2class labels contain class 0 (Person) and class 1 (Vehicle)
+#
+# Prerequisites:
+#   1. Run preprocess_hituav.py and remap_hituav_to_2class.py
+#   2. Run preprocess_dronergbt.py
+
+path: data
+
+train:
+  - hit-uav-2class/images/train
+  - dronergbt/rgb/train
+
+val:
+  - hit-uav-2class/images/val
+  - dronergbt/rgb/val
+
+test:
+  - hit-uav-2class/images/test
+  - dronergbt/rgb/test
+
+nc: 2
+names:
+  0: Person
+  1: Vehicle
