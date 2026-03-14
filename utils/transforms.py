@@ -103,6 +103,17 @@ class Pad:
         return image, target
 
 
+class Normalize:
+    """ImageNet normalization — required for pretrained ResNet backbone."""
+    IMAGENET_MEAN = [0.485, 0.456, 0.406]
+    IMAGENET_STD = [0.229, 0.224, 0.225]
+
+    def __call__(self, image, target):
+        if isinstance(image, torch.Tensor):
+            image = F.normalize(image, mean=self.IMAGENET_MEAN, std=self.IMAGENET_STD)
+        return image, target
+
+
 class ColorJitterRGB:
     """Color jitter for RGB (brightness/contrast) to reduce overfitting. Skips if image is not 3-channel."""
     def __init__(self, brightness=0.15, contrast=0.15):
@@ -124,7 +135,8 @@ def get_train_transform(max_size=640, multi_scale=False):
         ColorJitterRGB(brightness=0.15, contrast=0.15),
         RandomHorizontalFlip(prob=0.5),
         Resize(max_size=max_size, multi_scale=multi_scale),
-        Pad(size=(max_pad_size, max_pad_size), fill=0)
+        Pad(size=(max_pad_size, max_pad_size), fill=0),
+        Normalize(),
     ])
 
 
@@ -133,6 +145,7 @@ def get_val_transform(max_size=640):
     return Compose([
         ToTensor(),
         Resize(max_size=max_size),
-        Pad(size=(max_size, max_size), fill=0)
+        Pad(size=(max_size, max_size), fill=0),
+        Normalize(),
     ])
 

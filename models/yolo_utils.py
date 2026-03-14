@@ -52,8 +52,8 @@ def decode_bbox(predictions, grid_points, stride):
         dx = (2.0 * torch.sigmoid(dx) - 0.5) * stride
         dy = (2.0 * torch.sigmoid(dy) - 0.5) * stride
         # Clamp dw/dh to prevent exp explosion (avoids 700k+ box sizes from untrained predictions)
-        dw = torch.exp(torch.clamp(dw, max=3.5)) * stride
-        dh = torch.exp(torch.clamp(dh, max=3.5)) * stride
+        dw = torch.exp(torch.clamp(dw, max=5.0)) * stride
+        dh = torch.exp(torch.clamp(dh, max=5.0)) * stride
 
         x_center = grid[..., 0] + dx
         y_center = grid[..., 1] + dy
@@ -71,8 +71,8 @@ def decode_bbox(predictions, grid_points, stride):
         dx = (2.0 * torch.sigmoid(dx) - 0.5) * stride
         dy = (2.0 * torch.sigmoid(dy) - 0.5) * stride
         # Clamp dw/dh to prevent exp explosion (avoids 700k+ box sizes from untrained predictions)
-        dw = torch.exp(torch.clamp(dw, max=3.5)) * stride
-        dh = torch.exp(torch.clamp(dh, max=3.5)) * stride
+        dw = torch.exp(torch.clamp(dw, max=5.0)) * stride
+        dh = torch.exp(torch.clamp(dh, max=5.0)) * stride
 
         x_center = grid[..., 0] + dx
         y_center = grid[..., 1] + dy
