@@ -245,6 +245,230 @@ def main():
             plt.close()
             print(f"  Saved detection_examples")
 
+    # 6. F1-Confidence curve
+    try:
+        curves_data = getattr(metrics, 'curves_results', None)
+        f1_found = False
+        if curves_data is not None:
+            # curves_results: list of (x, y, xlabel, ylabel) tuples
+            for item in curves_data:
+                if len(item) >= 4 and 'F1' in str(item[3]):
+                    px_f1, py_f1 = np.asarray(item[0]), np.asarray(item[1])
+                    fig, ax = plt.subplots(figsize=(5, 4))
+                    py_f1_2d = np.atleast_2d(py_f1) if py_f1.ndim == 1 else py_f1
+                    for i in range(min(nc, py_f1_2d.shape[0] if py_f1_2d.ndim > 1 else 1)):
+                        y = py_f1_2d[i] if py_f1_2d.ndim > 1 else py_f1_2d.flatten()
+                        ax.plot(px_f1, y, label=names.get(i, f'Class {i}'), linewidth=2)
+                    ax.set_xlabel('Confidence Threshold')
+                    ax.set_ylabel('F1 Score')
+                    ax.set_title('F1-Confidence Curve')
+                    ax.legend()
+                    ax.set_xlim([0, 1.0])
+                    ax.set_ylim([0, 1.05])
+                    ax.grid(True, alpha=0.3)
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(args.output_dir, 'f1_confidence.pdf'), dpi=150, bbox_inches='tight')
+                    plt.savefig(os.path.join(args.output_dir, 'f1_confidence.png'), dpi=150, bbox_inches='tight')
+                    plt.close()
+                    print(f"  Saved f1_confidence")
+                    f1_found = True
+                    break
+        if not f1_found:
+            # Fallback: compute F1 from P and R arrays if available
+            p_arr = np.atleast_1d(getattr(metrics, 'p', None) or [])
+            r_arr = np.atleast_1d(getattr(metrics, 'r', None) or [])
+            if len(p_arr) > 0 and len(r_arr) > 0:
+                f1_vals = 2 * p_arr * r_arr / (p_arr + r_arr + 1e-9)
+                fig, ax = plt.subplots(figsize=(5, 4))
+                class_labels = [names.get(i, f'Class {i}') for i in range(min(nc, len(f1_vals)))]
+                ax.bar(class_labels, f1_vals[:nc], color=['steelblue', 'coral'][:nc])
+                ax.set_ylabel('F1 Score')
+                ax.set_title('F1 Score per Class')
+                ax.set_ylim([0, 1.05])
+                ax.grid(True, alpha=0.3, axis='y')
+                plt.tight_layout()
+                plt.savefig(os.path.join(args.output_dir, 'f1_confidence.pdf'), dpi=150, bbox_inches='tight')
+                plt.savefig(os.path.join(args.output_dir, 'f1_confidence.png'), dpi=150, bbox_inches='tight')
+                plt.close()
+                print(f"  Saved f1_confidence (bar fallback)")
+    except Exception as e:
+        print(f"  F1-Confidence curve skipped: {e}")
+
+    # 7. Training curves (loss + mAP over epochs) from results.csv
+    try:
+        import argparse as _ap
+        import csv
+        # Try to find results.csv from the training run directory
+        # User can pass --train_dir; default: look relative to model path
+        model_path = Path(args.model)
+        candidate_dirs = [
+            model_path.parent.parent,           # weights/../  = run dir
+            model_path.parent.parent.parent,     # one level up
+        ]
+        results_csv = None
+        for d in candidate_dirs:
+            csv_path = d / 'results.csv'
+            if csv_path.exists():
+                results_csv = csv_path
+                break
+
+        if results_csv is not None:
+            epochs_list, box_loss, cls_loss, dfl_loss, map50_list, map_list = [], [], [], [], [], []
+            with open(results_csv) as f:
+                reader = csv.DictReader(f)
+                # Strip whitespace from keys
+                for row in reader:
+                    row = {k.strip(): v.strip() for k, v in row.items()}
+                    try:
+                        epochs_list.append(int(float(row.get('epoch', 0))))
+                        # Losses
+                        box_loss.append(float(row.get('train/box_loss', row.get('box_loss', 0))))
+                        cls_loss.append(float(row.get('train/cls_loss', row.get('cls_loss', 0))))
+                        dfl_loss.append(float(row.get('train/dfl_loss', row.get('dfl_loss', 0))))
+                        # Metrics
+                        map50_list.append(float(row.get('metrics/mAP50(B)', row.get('mAP50', 0))))
+                        map_list.append(float(row.get('metrics/mAP50-95(B)', row.get('mAP50-95', 0))))
+                    except (ValueError, KeyError):
+                        continue
+
+            if epochs_list:
+                fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+                # Loss curves
+                axes[0].plot(epochs_list, box_loss, label='Box Loss', linewidth=2)
+                axes[0].plot(epochs_list, cls_loss, label='Cls Loss', linewidth=2)
+                axes[0].plot(epochs_list, dfl_loss, label='DFL Loss', linewidth=2)
+                axes[0].set_xlabel('Epoch')
+                axes[0].set_ylabel('Loss')
+                axes[0].set_title('Training Loss Curves')
+                axes[0].legend()
+                axes[0].grid(True, alpha=0.3)
+
+                # mAP curves
+                axes[1].plot(epochs_list, map50_list, label='mAP@50', linewidth=2, color='green')
+                axes[1].plot(epochs_list, map_list, label='mAP@50-95', linewidth=2, color='orange')
+                axes[1].set_xlabel('Epoch')
+                axes[1].set_ylabel('mAP')
+                axes[1].set_title('Validation mAP over Epochs')
+                axes[1].legend()
+                axes[1].grid(True, alpha=0.3)
+                axes[1].set_ylim([0, 1.05])
+
+                plt.tight_layout()
+                plt.savefig(os.path.join(args.output_dir, 'training_curves.pdf'), dpi=150, bbox_inches='tight')
+                plt.savefig(os.path.join(args.output_dir, 'training_curves.png'), dpi=150, bbox_inches='tight')
+                plt.close()
+                print(f"  Saved training_curves")
+        else:
+            print(f"  training_curves skipped: results.csv not found near {args.model}")
+    except Exception as e:
+        print(f"  Training curves skipped: {e}")
+
+    # 8. Per-class AP at multiple IoU thresholds
+    try:
+        all_ap = getattr(metrics, 'all_ap', None)
+        if all_ap is not None:
+            ap = np.array(all_ap)  # (nc, 10)
+            if ap.ndim == 2 and ap.shape[1] >= 3:
+                ious_sel = [0, 2, 4, 6, 9]  # IoU 0.50, 0.60, 0.70, 0.80, 0.95
+                iou_labels = ['0.50', '0.60', '0.70', '0.80', '0.95']
+                x = np.arange(len(ious_sel))
+                width = 0.35
+                fig, ax = plt.subplots(figsize=(7, 4))
+                colors = ['steelblue', 'coral']
+                for i in range(min(nc, ap.shape[0])):
+                    vals = ap[i, ious_sel]
+                    offset = (i - nc / 2 + 0.5) * width
+                    ax.bar(x + offset, vals, width, label=names.get(i, f'Class {i}'), color=colors[i % len(colors)])
+                ax.set_xticks(x)
+                ax.set_xticklabels([f'IoU={t}' for t in iou_labels])
+                ax.set_ylabel('AP')
+                ax.set_title('Per-class AP at Multiple IoU Thresholds')
+                ax.legend()
+                ax.set_ylim([0, 1.05])
+                ax.grid(True, alpha=0.3, axis='y')
+                plt.tight_layout()
+                plt.savefig(os.path.join(args.output_dir, 'ap_per_iou.pdf'), dpi=150, bbox_inches='tight')
+                plt.savefig(os.path.join(args.output_dir, 'ap_per_iou.png'), dpi=150, bbox_inches='tight')
+                plt.close()
+                print(f"  Saved ap_per_iou")
+    except Exception as e:
+        print(f"  AP per IoU skipped: {e}")
+
+    # 9. Confidence score distribution (TP vs FP)
+    try:
+        data_path_obj = Path(args.data)
+        import yaml as _yaml
+        with open(data_path_obj) as f:
+            cfg2 = _yaml.safe_load(f)
+        root2 = Path(cfg2['path'])
+        img_dir2 = root2 / 'images' / args.split
+        all_imgs = sorted(list(img_dir2.glob('*.jpg')) + list(img_dir2.glob('*.png')))
+        sample_imgs = all_imgs[:50]  # sample 50 images for speed
+
+        if sample_imgs:
+            pred_results2 = model.predict(sample_imgs, save=False, verbose=False, conf=0.01)
+            tp_scores, fp_scores = [], []
+            for res in pred_results2:
+                if res.boxes is None or len(res.boxes) == 0:
+                    continue
+                # Load corresponding label file
+                lbl_path = Path(str(res.path).replace('/images/', '/labels/'))
+                lbl_path = lbl_path.with_suffix('.txt')
+                if not lbl_path.exists():
+                    continue
+                gt_boxes = []
+                with open(lbl_path) as lf:
+                    for line in lf:
+                        parts = line.strip().split()
+                        if len(parts) == 5:
+                            _, cx, cy, w, h = map(float, parts)
+                            H, W = res.orig_img.shape[:2]
+                            x1 = (cx - w/2) * W; y1 = (cy - h/2) * H
+                            x2 = (cx + w/2) * W; y2 = (cy + h/2) * H
+                            gt_boxes.append([x1, y1, x2, y2])
+                if not gt_boxes:
+                    continue
+                gt_arr = np.array(gt_boxes)
+                matched = set()
+                for box in res.boxes:
+                    conf = float(box.conf[0])
+                    px1, py1, px2, py2 = box.xyxy[0].cpu().numpy()
+                    ious_box = []
+                    for gi, gb in enumerate(gt_arr):
+                        ix1 = max(px1, gb[0]); iy1 = max(py1, gb[1])
+                        ix2 = min(px2, gb[2]); iy2 = min(py2, gb[3])
+                        inter = max(0, ix2-ix1) * max(0, iy2-iy1)
+                        area_p = (px2-px1)*(py2-py1); area_g = (gb[2]-gb[0])*(gb[3]-gb[1])
+                        union = area_p + area_g - inter
+                        ious_box.append(inter / (union + 1e-7))
+                    best_gi = int(np.argmax(ious_box))
+                    if ious_box[best_gi] >= 0.5 and best_gi not in matched:
+                        tp_scores.append(conf)
+                        matched.add(best_gi)
+                    else:
+                        fp_scores.append(conf)
+
+            if tp_scores or fp_scores:
+                fig, ax = plt.subplots(figsize=(6, 4))
+                bins = np.linspace(0, 1, 25)
+                if tp_scores:
+                    ax.hist(tp_scores, bins=bins, alpha=0.7, label=f'TP (n={len(tp_scores)})', color='green')
+                if fp_scores:
+                    ax.hist(fp_scores, bins=bins, alpha=0.7, label=f'FP (n={len(fp_scores)})', color='red')
+                ax.set_xlabel('Confidence Score')
+                ax.set_ylabel('Count')
+                ax.set_title('Confidence Score Distribution (TP vs FP)')
+                ax.legend()
+                ax.grid(True, alpha=0.3)
+                plt.tight_layout()
+                plt.savefig(os.path.join(args.output_dir, 'score_distribution.pdf'), dpi=150, bbox_inches='tight')
+                plt.savefig(os.path.join(args.output_dir, 'score_distribution.png'), dpi=150, bbox_inches='tight')
+                plt.close()
+                print(f"  Saved score_distribution")
+    except Exception as e:
+        print(f"  Score distribution skipped: {e}")
+
     # Save metrics summary
     try:
         map50 = float(metrics.map50) if metrics.map50 is not None else 0
