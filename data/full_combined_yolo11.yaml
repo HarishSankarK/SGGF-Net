@@ -1,0 +1,30 @@
+# Full combined dataset: HIT-UAV thermal + DroneRGBT thermal + DroneRGBT RGB
+# Classes: Person (0), Vehicle (1)
+#
+# Image counts:
+#   HIT-UAV thermal   — train: 2008  val: 287
+#   DroneRGBT thermal — train: 1445  val: 180
+#   DroneRGBT RGB     — train: 1445  val: 180
+#   TOTAL             — train: 4898  val: 647
+
+path: /content/SGGF-Net/data
+
+train:
+  - hit-uav-2class/images/train
+  - DroneRGBT/thermal/train
+  - DroneRGBT/rgb/train
+
+val:
+  - hit-uav-2class/images/val
+  - DroneRGBT/thermal/val
+  - DroneRGBT/rgb/val
+
+test:
+  - hit-uav-2class/images/test
+  - DroneRGBT/thermal/test
+  - DroneRGBT/rgb/test
+
+nc: 2
+names:
+  0: Person
+  1: Vehicle
