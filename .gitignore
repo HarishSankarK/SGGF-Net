@@ -45,9 +45,10 @@ checkpoints/
 *~
 
 # Dataset - HIT-UAV is included in data/hit-uav/
-# Exclude other datasets and zip files
+# Exclude large datasets and zip files
 data/visdrone*/
 data/aitod*/
+data/DroneRGBT/
 datasets/
 *.zip
 *.tar
