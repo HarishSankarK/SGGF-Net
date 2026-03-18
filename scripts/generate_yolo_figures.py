@@ -29,9 +29,9 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     model = YOLO(args.model)
 
-    # Run validation to get metrics (no built-in plots to avoid KeyError)
+    # Run validation to get metrics — plots=True ensures confusion_matrix is populated
     print("Running validation...")
-    results = model.val(data=args.data, split=args.split, plots=False, verbose=True)
+    results = model.val(data=args.data, split=args.split, plots=True, verbose=True)
 
     # Extract metrics - results has .box (BoxMetrics)
     metrics = results.box
@@ -44,8 +44,12 @@ def main():
         cm_obj = getattr(results, 'confusion_matrix', None)
         if cm_obj is not None and hasattr(cm_obj, 'matrix'):
             raw = np.asarray(cm_obj.matrix, dtype=np.float64)
-            if raw.size > 0 and raw.shape[0] == nc + 1 and raw.shape[1] == nc + 1:
-                cm = raw.copy()
+            if raw.size > 0:
+                if raw.shape[0] == nc + 1 and raw.shape[1] == nc + 1:
+                    cm = raw.copy()
+                elif raw.shape[0] == nc and raw.shape[1] == nc:
+                    # Pad with empty background row/col
+                    cm[:nc, :nc] = raw
     except Exception:
         pass
 

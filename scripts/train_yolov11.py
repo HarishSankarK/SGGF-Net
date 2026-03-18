@@ -35,9 +35,10 @@ from ultralytics import YOLO
 
 # ── Dataset YAML paths (relative to project root sggf_net/) ─────────────────
 DATASET_YAMLS = {
-    "hituav":    "data/hit-uav-2class/hituav_2class.yaml",
-    "dronergbt": "data/dronergbt_yolo11.yaml",
-    "combined":  "data/combined_yolo11.yaml",
+    "hituav":         "data/hit-uav-2class/hituav_2class.yaml",
+    "dronergbt":      "data/dronergbt_yolo11.yaml",
+    "combined":       "data/combined_yolo11.yaml",
+    "full_combined":  "data/full_combined_yolo11.yaml",   # HIT-UAV + DroneRGBT thermal + RGB
 }
 
 # ── Default pretrained YOLOv11 weights (downloaded automatically) ─────────────
@@ -49,7 +50,7 @@ def parse_args():
 
     parser.add_argument(
         "--dataset",
-        choices=["hituav", "dronergbt", "combined"],
+        choices=["hituav", "dronergbt", "combined", "full_combined"],
         required=True,
         help="Dataset to train on",
     )
