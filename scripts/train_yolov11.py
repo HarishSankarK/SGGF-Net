@@ -1,29 +1,38 @@
 """
-YOLOv11 Training / Finetuning Script
-=====================================
-Supports: HIT-UAV | DroneRGBT | Combined
+YOLOv11 Training / Finetuning Script  (Drive-resumable)
+=========================================================
+Supports: HIT-UAV | DroneRGBT | Combined | Full-Combined
 
 Usage examples:
   # Train from scratch on HIT-UAV
   python scripts/train_yolov11.py --dataset hituav
 
-  # Train from scratch on DroneRGBT
-  python scripts/train_yolov11.py --dataset dronergbt
+  # Train on combined dataset, save directly to Google Drive
+  python scripts/train_yolov11.py --dataset full_combined \
+      --drive_dir /content/drive/MyDrive/sggf_checkpoints/yolov11 \
+      --name combined_finetune4
 
-  # Train on combined dataset
-  python scripts/train_yolov11.py --dataset combined
+  # Auto-resume from Drive (detects last.pt automatically)
+  python scripts/train_yolov11.py --dataset full_combined \
+      --drive_dir /content/drive/MyDrive/sggf_checkpoints/yolov11 \
+      --name combined_finetune4 --resume
 
   # Finetune from existing checkpoint
   python scripts/train_yolov11.py --dataset hituav --finetune checkpoints/best.pt
-
-  # Finetune HIT_UAV_CHKPT on DroneRGBT
-  python scripts/train_yolov11.py --dataset dronergbt --finetune sggf_net/HIT_UAV_CHKPT/weights/best.pt
 
   # Choose model size: n / s / m / l / x (default: m)
   python scripts/train_yolov11.py --dataset combined --model yolo11m.pt
 
   # Custom epochs / batch / image size
   python scripts/train_yolov11.py --dataset hituav --epochs 100 --batch 8 --imgsz 640
+
+Drive-resume behaviour:
+  - If --drive_dir is set, the run project folder is placed INSIDE Drive so
+    Ultralytics writes weights directly there (no copy step needed).
+  - If --resume is passed AND last.pt exists in Drive, training continues
+    from the last saved epoch automatically.
+  - If --resume is passed but last.pt is missing, training starts fresh
+    with a warning (safe first-run behaviour).
 """
 
 import argparse
@@ -84,6 +93,14 @@ def parse_args():
                         help="Run name (auto-generated if not set)")
     parser.add_argument("--patience", type=int,  default=50,
                         help="Early stopping patience (0 = disabled)")
+    parser.add_argument("--drive_dir", type=str, default=None,
+                        help="Google Drive folder for checkpoints, e.g. "
+                             "/content/drive/MyDrive/sggf_checkpoints/yolov11 "
+                             "If set, overrides --project and saves directly to Drive.")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from last.pt in Drive (requires --drive_dir and --name). "
+                             "Safe to pass on first run — falls back to fresh training if "
+                             "last.pt is not found.")
 
     return parser.parse_args()
 
@@ -118,26 +135,55 @@ def build_run_name(args):
     return f"yolov11_{args.dataset}_{mode}"
 
 
+def resolve_drive(args, root_dir, run_name):
+    """
+    Determine the project directory and whether we are resuming.
+
+    Returns (project_dir: str, resume_from: str | None)
+      - project_dir  : passed as `project=` to model.train()
+      - resume_from  : path to last.pt if resuming, else None
+    """
+    if args.drive_dir:
+        project_dir = str(Path(args.drive_dir))
+    else:
+        project_dir = str(root_dir / args.project)
+
+    resume_from = None
+    if args.resume:
+        last_pt = Path(project_dir) / run_name / "weights" / "last.pt"
+        if last_pt.exists():
+            resume_from = str(last_pt)
+            print(f"  [Resume] Found last.pt → {resume_from}")
+        else:
+            print(f"  [Resume] last.pt not found at {last_pt} — starting fresh")
+
+    return project_dir, resume_from
+
+
 def main():
     args = parse_args()
     yaml_path, model_path, root_dir = resolve_paths(args)
     run_name = build_run_name(args)
+    project_dir, resume_from = resolve_drive(args, root_dir, run_name)
 
     print("\n" + "=" * 60)
-    print(f"  YOLOv11 {'Finetuning' if args.finetune else 'Training'}")
+    print(f"  YOLOv11 {'Resume' if resume_from else 'Finetune' if args.finetune else 'Training'}")
     print("=" * 60)
     print(f"  Dataset  : {args.dataset}  ({yaml_path})")
-    print(f"  Model    : {model_path}")
+    print(f"  Model    : {resume_from if resume_from else model_path}")
     print(f"  Epochs   : {args.epochs}")
     print(f"  Batch    : {args.batch}")
     print(f"  Img size : {args.imgsz}")
-    print(f"  Output   : {args.project}/{run_name}")
-    if args.finetune:
+    print(f"  Output   : {project_dir}/{run_name}")
+    if args.drive_dir:
+        print(f"  Drive    : {args.drive_dir}  (checkpoints saved directly to Drive)")
+    if args.finetune and not resume_from:
         print(f"  Freeze   : first {args.freeze} layers" if args.freeze else "  Freeze   : none (all layers trainable)")
     print("=" * 60 + "\n")
 
     # ── Load model ────────────────────────────────────────────────────────────
-    model = YOLO(model_path)
+    # When resuming, load last.pt; Ultralytics restores all training state
+    model = YOLO(resume_from if resume_from else model_path)
 
     # ── Train ─────────────────────────────────────────────────────────────────
     train_kwargs = dict(
@@ -147,7 +193,7 @@ def main():
         imgsz    = args.imgsz,
         workers  = args.workers,
         lr0      = args.lr0,
-        project  = str(root_dir / args.project),
+        project  = project_dir,
         name     = run_name,
         patience = args.patience,
         save     = True,
@@ -155,16 +201,20 @@ def main():
         verbose  = True,
     )
 
+    # When resuming, Ultralytics needs resume=True to restore optimizer/epoch state
+    if resume_from:
+        train_kwargs["resume"] = True
+
     # Device (empty string = Ultralytics auto-select)
     if args.device:
         train_kwargs["device"] = args.device
 
-    # Freeze layers when finetuning
-    if args.finetune and args.freeze is not None:
+    # Freeze layers when finetuning (not applicable when resuming)
+    if args.finetune and not resume_from and args.freeze is not None:
         train_kwargs["freeze"] = args.freeze
 
-    # Lower LR for finetuning if not explicitly overridden
-    if args.finetune and args.lr0 == 0.01:
+    # Lower LR for finetuning if not explicitly overridden and not resuming
+    if args.finetune and not resume_from and args.lr0 == 0.01:
         train_kwargs["lr0"] = 0.001
         train_kwargs["lrf"] = 0.01
         print("  [Finetune] lr0 auto-adjusted to 0.001")
@@ -178,6 +228,8 @@ def main():
     print(f"  Best weights : {save_dir / 'weights' / 'best.pt'}")
     print(f"  Last weights : {save_dir / 'weights' / 'last.pt'}")
     print(f"  Results      : {save_dir}")
+    if args.drive_dir:
+        print(f"  Drive path   : {args.drive_dir}/{run_name}/weights/best.pt")
     print("=" * 60 + "\n")
 
 
