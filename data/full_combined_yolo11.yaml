@@ -6,23 +6,26 @@
 #   DroneRGBT thermal — train: 1445  val: 180
 #   DroneRGBT RGB     — train: 1445  val: 180
 #   TOTAL             — train: 4898  val: 647
+#
+# IMPORTANT: DroneRGBT must be restructured into images/ and labels/ dirs
+# before training. Run: python scripts/setup_dronergbt_yolo.py
 
 path: /content/SGGF-Net/data
 
 train:
   - hit-uav-2class/images/train
-  - DroneRGBT/thermal/train
-  - DroneRGBT/rgb/train
+  - DroneRGBT/thermal/images/train
+  - DroneRGBT/rgb/images/train
 
 val:
   - hit-uav-2class/images/val
-  - DroneRGBT/thermal/val
-  - DroneRGBT/rgb/val
+  - DroneRGBT/thermal/images/val
+  - DroneRGBT/rgb/images/val
 
 test:
   - hit-uav-2class/images/test
-  - DroneRGBT/thermal/test
-  - DroneRGBT/rgb/test
+  - DroneRGBT/thermal/images/test
+  - DroneRGBT/rgb/images/test
 
 nc: 2
 names:
