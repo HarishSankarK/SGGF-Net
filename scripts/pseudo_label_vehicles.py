@@ -11,7 +11,11 @@ Strategy:
               boxes from the corresponding RGB label file into the thermal label file.
               Boxes are in normalised xywh, so they transfer well between paired frames.
 
-Usage (on Colab after cloning repo and mounting Drive):
+Works with YOLO-restructured layout:
+  rgb/images/train/*.jpg  +  rgb/labels/train/*.txt
+  thermal/images/train/*.jpg  +  thermal/labels/train/*.txt
+
+Usage (on Colab AFTER setup_dronergbt_yolo.py):
     python3 scripts/pseudo_label_vehicles.py \
         --dronergbt_dir data/DroneRGBT \
         --conf 0.35 \
@@ -38,9 +42,14 @@ def label_rgb(rgb_dir: Path, conf: float, model_name: str, dry_run: bool):
     total_added = 0
 
     for split in splits:
-        img_dir = rgb_dir / split
+        # Support both restructured (images/train/) and flat (train/) layouts
+        img_dir = rgb_dir / "images" / split
+        lbl_dir = rgb_dir / "labels" / split
         if not img_dir.exists():
-            print(f"  [skip] {img_dir} not found")
+            img_dir = rgb_dir / split
+            lbl_dir = rgb_dir / split  # flat: labels next to images
+        if not img_dir.exists():
+            print(f"  [skip] {split}: no image dir found")
             continue
 
         images = sorted(list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.png")))
@@ -48,7 +57,8 @@ def label_rgb(rgb_dir: Path, conf: float, model_name: str, dry_run: bool):
 
         added = 0
         for img_path in tqdm(images, desc=f"RGB/{split}"):
-            label_path = img_path.with_suffix(".txt")
+            # Label goes in lbl_dir with same stem
+            label_path = lbl_dir / (img_path.stem + ".txt")
 
             results = model(str(img_path), conf=conf, verbose=False)[0]
 
@@ -91,9 +101,12 @@ def transfer_to_thermal(rgb_dir: Path, thermal_dir: Path, dry_run: bool):
     total_transferred = 0
 
     for split in splits:
-        rgb_lbl_dir = rgb_dir / split
-        thr_lbl_dir = thermal_dir / split
-
+        # Support both restructured and flat layouts
+        rgb_lbl_dir = rgb_dir / "labels" / split
+        thr_lbl_dir = thermal_dir / "labels" / split
+        if not rgb_lbl_dir.exists():
+            rgb_lbl_dir = rgb_dir / split
+            thr_lbl_dir = thermal_dir / split
         if not rgb_lbl_dir.exists() or not thr_lbl_dir.exists():
             print(f"  [skip] {split}: RGB={rgb_lbl_dir.exists()} Thermal={thr_lbl_dir.exists()}")
             continue
