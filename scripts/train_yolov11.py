@@ -37,8 +37,11 @@ Drive-resume behaviour:
 
 import argparse
 import os
+import random
 from pathlib import Path
 
+import cv2
+import numpy as np
 from ultralytics import YOLO
 
 
@@ -160,6 +163,77 @@ def resolve_drive(args, root_dir, run_name):
     return project_dir, resume_from
 
 
+# ── Sample prediction every N epochs ─────────────────────────────────────────
+
+SAMPLE_IMAGES = {
+    "HIT-UAV":           "data/hit-uav-2class/images/val",
+    "DroneRGBT-RGB":     "data/DroneRGBT/rgb/images/val",
+    "DroneRGBT-Thermal": "data/DroneRGBT/thermal/images/val",
+}
+PREDICT_EVERY = 5  # epochs
+
+
+def pick_random_samples(root_dir: Path) -> dict:
+    """Pick one random image from each dataset source."""
+    samples = {}
+    for name, rel_path in SAMPLE_IMAGES.items():
+        img_dir = root_dir / rel_path
+        if not img_dir.exists():
+            continue
+        imgs = list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.png"))
+        if imgs:
+            samples[name] = random.choice(imgs)
+    return samples
+
+
+def display_predictions(model, samples: dict, epoch: int, save_dir: Path):
+    """Run inference on sample images and display them inline (Colab/Jupyter)."""
+    try:
+        from IPython.display import display, HTML
+        from IPython import get_ipython
+        in_notebook = get_ipython() is not None
+    except (ImportError, AttributeError):
+        in_notebook = False
+
+    pred_dir = save_dir / "sample_predictions"
+    pred_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n{'─'*50}")
+    print(f"  Sample predictions — Epoch {epoch}")
+    print(f"{'─'*50}")
+
+    for name, img_path in samples.items():
+        results = model(str(img_path), conf=0.20, iou=0.30, verbose=False)[0]
+        n_det = len(results.boxes) if results.boxes is not None else 0
+        annotated = results.plot()
+
+        out_path = pred_dir / f"epoch{epoch:03d}_{name}.jpg"
+        cv2.imwrite(str(out_path), annotated, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        print(f"  {name}: {n_det} detections  ({img_path.name})")
+
+        if in_notebook:
+            # Display inline in Colab
+            from IPython.display import Image, display as ipy_display
+            ipy_display(HTML(f"<b>{name}</b> — {n_det} detections (epoch {epoch})"))
+            ipy_display(Image(filename=str(out_path), width=500))
+
+    print(f"  Saved to {pred_dir}/")
+    print(f"{'─'*50}\n")
+
+
+def make_epoch_end_callback(root_dir: Path, save_dir: Path):
+    """Create a callback that predicts samples every PREDICT_EVERY epochs."""
+    samples = pick_random_samples(root_dir)
+
+    def on_train_epoch_end(trainer):
+        epoch = trainer.epoch + 1  # 0-indexed → 1-indexed
+        if epoch % PREDICT_EVERY != 0:
+            return
+        display_predictions(trainer.model, samples, epoch, save_dir)
+
+    return on_train_epoch_end
+
+
 def main():
     args = parse_args()
     yaml_path, model_path, root_dir = resolve_paths(args)
@@ -218,6 +292,11 @@ def main():
         train_kwargs["lr0"] = 0.001
         train_kwargs["lrf"] = 0.01
         print("  [Finetune] lr0 auto-adjusted to 0.001")
+
+    # ── Register sample-prediction callback ───────────────────────────────────
+    save_path = Path(project_dir) / run_name
+    callback = make_epoch_end_callback(root_dir, save_path)
+    model.add_callback("on_train_epoch_end", callback)
 
     results = model.train(**train_kwargs)
 
