@@ -186,8 +186,16 @@ def pick_random_samples(root_dir: Path) -> dict:
     return samples
 
 
-def display_predictions(model, samples: dict, epoch: int, save_dir: Path):
+def display_predictions(save_dir: Path, samples: dict, epoch: int):
     """Run inference on sample images and display them inline (Colab/Jupyter)."""
+    # Load current best/last weights via YOLO wrapper (not raw nn.Module)
+    last_pt = save_dir / "weights" / "last.pt"
+    if not last_pt.exists():
+        print(f"  [sample predictions] last.pt not found, skipping")
+        return
+
+    pred_model = YOLO(str(last_pt))
+
     try:
         from IPython.display import display, HTML
         from IPython import get_ipython
@@ -203,7 +211,7 @@ def display_predictions(model, samples: dict, epoch: int, save_dir: Path):
     print(f"{'─'*50}")
 
     for name, img_path in samples.items():
-        results = model(str(img_path), conf=0.20, iou=0.30, verbose=False)[0]
+        results = pred_model(str(img_path), conf=0.20, iou=0.30, verbose=False)[0]
         n_det = len(results.boxes) if results.boxes is not None else 0
         annotated = results.plot()
 
@@ -212,13 +220,15 @@ def display_predictions(model, samples: dict, epoch: int, save_dir: Path):
         print(f"  {name}: {n_det} detections  ({img_path.name})")
 
         if in_notebook:
-            # Display inline in Colab
             from IPython.display import Image, display as ipy_display
             ipy_display(HTML(f"<b>{name}</b> — {n_det} detections (epoch {epoch})"))
             ipy_display(Image(filename=str(out_path), width=500))
 
     print(f"  Saved to {pred_dir}/")
     print(f"{'─'*50}\n")
+
+    # Free memory
+    del pred_model
 
 
 def make_epoch_end_callback(root_dir: Path, save_dir: Path):
@@ -229,7 +239,7 @@ def make_epoch_end_callback(root_dir: Path, save_dir: Path):
         epoch = trainer.epoch + 1  # 0-indexed → 1-indexed
         if epoch % PREDICT_EVERY != 0:
             return
-        display_predictions(trainer.model, samples, epoch, save_dir)
+        display_predictions(save_dir, samples, epoch)
 
     return on_train_epoch_end
 
