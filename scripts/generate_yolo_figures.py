@@ -53,9 +53,9 @@ def main():
     except Exception:
         pass
 
-    # Labels: Ultralytics order is class 0..nc-1, then background at index nc
-    labels = [names.get(i, f'C{i}') for i in range(nc)] + ['background']
-    cm = cm[:len(labels), :len(labels)]  # ensure shape matches
+    # Strip background row/col — keep only Person and Vehicle
+    labels = [names.get(i, f'C{i}') for i in range(nc)]
+    cm = cm[:nc, :nc]  # drop background (last row & col)
 
     # Plot: use counts, vmin=0 (no negative values)
     fig, ax = plt.subplots(figsize=(5, 4))
