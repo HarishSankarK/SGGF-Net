@@ -6,6 +6,8 @@ Evaluates multimodal RGB-Thermal object detection model
 import os
 import sys
 import argparse
+import shutil
+import tempfile
 import torch
 from torch.utils.data import DataLoader, ConcatDataset
 from tqdm import tqdm
@@ -18,6 +20,11 @@ from models import FusionYOLOv11
 from utils.dataset import DroneRGBTDataset, HITUAVDataset
 from utils.transforms import get_val_transform
 from utils.metrics import calculate_map, calculate_ap50, calculate_precision_recall_f1
+
+try:
+    from ultralytics import YOLO
+except ImportError:
+    YOLO = None
 
 
 def collate_fn_paired(batch):
@@ -60,6 +67,68 @@ def collate_fn_combined(batch):
         targets.append(item[1])
     
     return rgb_images, thermal_images, targets
+
+
+def tensor_to_uint8_image(image_tensor):
+    image = image_tensor.detach().cpu().permute(1, 2, 0).numpy()
+    image = np.clip(image, 0.0, 1.0)
+    return (image * 255).astype(np.uint8)
+
+
+def is_ultralytics_checkpoint(path):
+    try:
+        ckpt = torch.load(path, map_location='cpu', weights_only=False)
+    except Exception:
+        return str(path).endswith('.pt')
+    return isinstance(ckpt, dict) and 'train_args' in ckpt and 'ema' in ckpt
+
+
+class UltralyticsAdapter:
+    def __init__(self, checkpoint_path):
+        if YOLO is None:
+            raise ImportError("Ultralytics is not installed, so this checkpoint cannot be loaded here.")
+        load_path = checkpoint_path
+        self._temp_path = None
+        if not str(checkpoint_path).endswith('.pt'):
+            fd, self._temp_path = tempfile.mkstemp(suffix='.pt')
+            os.close(fd)
+            shutil.copy2(checkpoint_path, self._temp_path)
+            load_path = self._temp_path
+        self.model = YOLO(load_path, task='detect')
+
+    def eval(self):
+        return self
+
+    def to(self, device):
+        self.device = device
+        return self
+
+    def __del__(self):
+        if getattr(self, '_temp_path', None):
+            try:
+                os.remove(self._temp_path)
+            except OSError:
+                pass
+
+    def predict(self, rgb_images, thermal_images=None, conf_threshold=0.5, nms_threshold=0.5):
+        images = [tensor_to_uint8_image(img) for img in rgb_images]
+        results = self.model.predict(source=images, conf=conf_threshold, iou=nms_threshold, verbose=False)
+        predictions = []
+        for result in results:
+            boxes = result.boxes
+            if boxes is None or boxes.xyxy.numel() == 0:
+                predictions.append({
+                    'boxes': torch.zeros((0, 4), dtype=torch.float32),
+                    'scores': torch.zeros((0,), dtype=torch.float32),
+                    'labels': torch.zeros((0,), dtype=torch.long),
+                })
+                continue
+            predictions.append({
+                'boxes': boxes.xyxy.detach().cpu(),
+                'scores': boxes.conf.detach().cpu(),
+                'labels': boxes.cls.detach().cpu().to(torch.long) + 1,
+            })
+        return predictions
 
 
 def evaluate(model, dataloader, device, num_classes, conf_threshold=0.5, nms_threshold=0.5):
@@ -249,36 +318,39 @@ def main():
         pin_memory=use_cuda
     )
     
-    # Load checkpoint first to get backbone and num_classes (so model architecture matches)
-    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    backbone = checkpoint.get('backbone', args.backbone) if isinstance(checkpoint, dict) else args.backbone
-    # Model num_classes = foreground classes (2 for person+vehicle). Metrics use args.num_classes (3) to iterate classes 1,2
-    model_num_classes = checkpoint.get('num_classes') if isinstance(checkpoint, dict) else None
-    if model_num_classes is None:
-        model_num_classes = 2 if args.num_classes >= 3 else 1
-    
-    # Create model with same backbone and num_classes as checkpoint
-    model = FusionYOLOv11(
-        num_classes=model_num_classes,
-        pretrained=False,
-        fusion_type='concat_attention',
-        backbone=backbone
-    )
-    if 'ema_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['ema_state_dict'])
-        print("Loaded EMA weights from checkpoint")
-    elif 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
-        print("Loaded model_state_dict from checkpoint")
+    if is_ultralytics_checkpoint(args.checkpoint):
+        model = UltralyticsAdapter(args.checkpoint).to(device).eval()
+        print("Loaded Ultralytics checkpoint")
     else:
-        model.load_state_dict(checkpoint)
-    if isinstance(checkpoint, dict):
-        print(f"Checkpoint epoch: {checkpoint.get('epoch', 'unknown')}")
-        if 'best_map' in checkpoint:
-            print(f"Best mAP in checkpoint: {checkpoint['best_map']:.4f}")
-    
-    model = model.to(device)
-    model.eval()
+        # Load checkpoint first to get backbone and num_classes (so model architecture matches)
+        checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+        backbone = checkpoint.get('backbone', args.backbone) if isinstance(checkpoint, dict) else args.backbone
+        # Model num_classes = foreground classes (2 for person+vehicle). Metrics use args.num_classes (3) to iterate classes 1,2
+        model_num_classes = checkpoint.get('num_classes') if isinstance(checkpoint, dict) else None
+        if model_num_classes is None:
+            model_num_classes = 2 if args.num_classes >= 3 else 1
+
+        model = FusionYOLOv11(
+            num_classes=model_num_classes,
+            pretrained=False,
+            fusion_type='concat_attention',
+            backbone=backbone
+        )
+        if 'ema_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['ema_state_dict'])
+            print("Loaded EMA weights from checkpoint")
+        elif 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+            print("Loaded model_state_dict from checkpoint")
+        else:
+            model.load_state_dict(checkpoint)
+        if isinstance(checkpoint, dict):
+            print(f"Checkpoint epoch: {checkpoint.get('epoch', 'unknown')}")
+            if 'best_map' in checkpoint:
+                print(f"Best mAP in checkpoint: {checkpoint['best_map']:.4f}")
+
+        model = model.to(device)
+        model.eval()
     
     # Evaluate
     metrics = evaluate(

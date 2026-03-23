@@ -7,6 +7,8 @@ Usage:
 import os
 import sys
 import argparse
+import shutil
+import tempfile
 import torch
 import numpy as np
 from PIL import Image
@@ -16,9 +18,60 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from models import FusionYOLOv11
 from utils.transforms import get_val_transform
 
+try:
+    from ultralytics import YOLO
+except ImportError:
+    YOLO = None
+
 
 CLASS_NAMES = {1: 'Person', 2: 'Vehicle'}
 COLORS = {1: (0, 255, 0), 2: (0, 0, 255)}  # Green, Blue
+
+
+def is_ultralytics_checkpoint_path(checkpoint_path):
+    try:
+        ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    except Exception:
+        return checkpoint_path.endswith('.pt')
+    return isinstance(ckpt, dict) and 'train_args' in ckpt and 'ema' in ckpt
+
+
+def ultralytics_predict(checkpoint_path, image_np, conf_threshold, nms_threshold, device):
+    if YOLO is None:
+        raise ImportError("Ultralytics is not installed, so .pt checkpoints cannot be loaded here.")
+    device_arg = 'cpu' if device.type == 'cpu' else str(device)
+    load_path = checkpoint_path
+    temp_path = None
+    if not checkpoint_path.endswith('.pt'):
+        fd, temp_path = tempfile.mkstemp(suffix='.pt')
+        os.close(fd)
+        shutil.copy2(checkpoint_path, temp_path)
+        load_path = temp_path
+    model = YOLO(load_path, task='detect')
+    result = model.predict(
+        source=image_np,
+        conf=conf_threshold,
+        iou=nms_threshold,
+        device=device_arg,
+        verbose=False
+    )[0]
+    if temp_path is not None:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+    boxes = result.boxes
+    if boxes is None or boxes.xyxy.numel() == 0:
+        return {
+            'boxes': torch.zeros((0, 4), dtype=torch.float32),
+            'scores': torch.zeros((0,), dtype=torch.float32),
+            'labels': torch.zeros((0,), dtype=torch.long),
+        }
+    return {
+        'boxes': boxes.xyxy.detach().cpu(),
+        'scores': boxes.conf.detach().cpu(),
+        'labels': boxes.cls.detach().cpu().to(torch.long) + 1,
+    }
 
 
 def main():
@@ -64,22 +117,30 @@ def main():
     target = {'boxes': torch.zeros((0, 4)), 'labels': torch.zeros((0,), dtype=torch.long)}
     img_tensor, _ = transform(img_pil, target)
     H, W = img_tensor.shape[1], img_tensor.shape[2]
+    scale = min(args.max_size / orig_h, args.max_size / orig_w)
 
-    # Load checkpoint first to get backbone and num_classes (so model architecture matches)
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    backbone = ckpt.get('backbone', 'resnet50') if isinstance(ckpt, dict) else 'resnet50'
-    model_num_classes = ckpt.get('num_classes') if isinstance(ckpt, dict) else None
-    if model_num_classes is None:
-        model_num_classes = 2 if args.num_classes >= 3 else args.num_classes
-    model = FusionYOLOv11(num_classes=model_num_classes, pretrained=False, fusion_type='concat_attention', backbone=backbone)
-    model.load_state_dict(ckpt.get('ema_state_dict', ckpt['model_state_dict']))
-    model = model.to(device).eval()
+    is_ultra = is_ultralytics_checkpoint_path(args.checkpoint)
 
-    # Predict (SMOD/RGB: use same image for both streams)
-    with torch.no_grad():
-        inp = img_tensor.unsqueeze(0).to(device)
-        preds = model.predict(inp, inp, conf_threshold=args.conf_threshold,
-                              nms_threshold=args.nms_threshold)[0]
+    if is_ultra:
+        preds = ultralytics_predict(
+            args.checkpoint, img_np, args.conf_threshold, args.nms_threshold, device
+        )
+    else:
+        # Load checkpoint first to get backbone and num_classes (so model architecture matches)
+        ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+        backbone = ckpt.get('backbone', 'resnet50') if isinstance(ckpt, dict) else 'resnet50'
+        model_num_classes = ckpt.get('num_classes') if isinstance(ckpt, dict) else None
+        if model_num_classes is None:
+            model_num_classes = 2 if args.num_classes >= 3 else args.num_classes
+        model = FusionYOLOv11(num_classes=model_num_classes, pretrained=False, fusion_type='concat_attention', backbone=backbone)
+        model.load_state_dict(ckpt.get('ema_state_dict', ckpt['model_state_dict']))
+        model = model.to(device).eval()
+
+        # Predict (SMOD/RGB: use same image for both streams)
+        with torch.no_grad():
+            inp = img_tensor.unsqueeze(0).to(device)
+            preds = model.predict(inp, inp, conf_threshold=args.conf_threshold,
+                                  nms_threshold=args.nms_threshold)[0]
 
     # Apply max_detections (keep top by score)
     if len(preds['boxes']) > args.max_detections:
@@ -93,19 +154,31 @@ def main():
         keep = (areas >= args.min_box_area) & (areas <= img_area * args.max_box_area_ratio)
         preds = {k: v[keep] for k, v in preds.items()}
 
-    # Draw on transformed image (predictions are in resized/padded coords)
-    img_out = img_tensor.permute(1, 2, 0).numpy()
-    img_out = (np.clip(img_out, 0, 1) * 255).astype(np.uint8)
+    # Draw on the original image. Fusion-model predictions are in resized/padded coords,
+    # so map them back by undoing the resize scale. Padding is only on right/bottom.
+    preds_to_draw = preds
+    if not is_ultra and len(preds['boxes']) > 0:
+        boxes = preds['boxes'].clone()
+        boxes = boxes / scale
+        boxes[:, 0::2] = boxes[:, 0::2].clamp(0, orig_w)
+        boxes[:, 1::2] = boxes[:, 1::2].clamp(0, orig_h)
+        preds_to_draw = {
+            'boxes': boxes,
+            'scores': preds['scores'],
+            'labels': preds['labels'],
+        }
+
+    img_out = img_np.copy()
     # Use matplotlib for drawing (consistent with eval figures)
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots(figsize=(12, 8))
     ax.imshow(img_out)
-    for i in range(len(preds['boxes'])):
-        x1, y1, x2, y2 = preds['boxes'][i].cpu().tolist()
-        score = preds['scores'][i].item()
-        lab = preds['labels'][i].item()
+    for i in range(len(preds_to_draw['boxes'])):
+        x1, y1, x2, y2 = preds_to_draw['boxes'][i].cpu().tolist()
+        score = preds_to_draw['scores'][i].item()
+        lab = preds_to_draw['labels'][i].item()
         color = ['green', 'blue'][lab - 1] if lab in (1, 2) else 'red'
         rect = plt.Rectangle((x1, y1), x2 - x1, y2 - y1, fill=False, color=color, linewidth=2)
         ax.add_patch(rect)

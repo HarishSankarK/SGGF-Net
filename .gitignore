@@ -31,7 +31,7 @@ ENV/
 *.pt
 checkpoints/
 *.ckpt
-
+gui/
 # Jupyter Notebook
 .ipynb_checkpoints
 # Allow .ipynb files (Colab notebook should be committed)
